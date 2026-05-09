@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import LoadingScreen from '../components/LoadingScreen.jsx'
+import Notepad from '../components/Notepad.jsx'
 
 export default function QuestScreen({
   quest, lesson, showLesson, questReady,
@@ -14,6 +15,10 @@ export default function QuestScreen({
   onStretchAnswer, onStretchDismiss,
   onBack, onRetry,
 }) {
+  // Notepad open state — persists for the duration of this QuestScreen mount
+  // (i.e. across questions in the same quest, but resets between quests).
+  const [notepadOpen, setNotepadOpen] = useState(false)
+
   if (loading) return <LoadingScreen message={`Preparing your ${subject?.label} quest…`} />
 
   if (error) return (
@@ -38,7 +43,7 @@ export default function QuestScreen({
     color: '#1a1a2e',
   }
 
-  // ── Lesson screen (NEW): shown first, while questions load in background ──
+  // ── Lesson screen ─────────────────────────────────────────────────────────
   if (showLesson) return (
     <div style={{ minHeight: '100vh', padding: '20px 16px', display: 'flex', alignItems: 'center' }}>
       <div style={{ ...cardStyle, borderTop: `5px solid ${subject?.color}` }} className="animate-pop">
@@ -83,6 +88,21 @@ export default function QuestScreen({
             }}>
               {lesson.lesson}
             </div>
+            {Array.isArray(lesson.keyTerms) && lesson.keyTerms.length > 0 && (
+              <div style={{
+                background: '#f0fdf4', borderRadius: 10, padding: '10px 14px',
+                marginBottom: 12, border: '1px solid #bbf7d0',
+              }}>
+                <div style={{ fontSize: 11, fontWeight: 800, color: '#166534', letterSpacing: 1, marginBottom: 6 }}>
+                  📚 KEY TERMS
+                </div>
+                {lesson.keyTerms.map((kt, i) => (
+                  <div key={i} style={{ fontSize: 13, color: '#1e293b', lineHeight: 1.5, marginBottom: 4 }}>
+                    <strong>{kt.term}:</strong> {kt.definition}
+                  </div>
+                ))}
+              </div>
+            )}
             {lesson.watchOut && (
               <div style={{
                 background: '#fef9c3', borderRadius: 10, padding: '10px 14px',
@@ -115,7 +135,7 @@ export default function QuestScreen({
     </div>
   )
 
-  // ── Quest intro (story) — shown after lesson dismissed, before Q1 ──────────
+  // ── Quest intro ────────────────────────────────────────────────────────────
   if (isIntro && quest) return (
     <div style={{ minHeight: '100vh', padding: '20px 16px', display: 'flex', alignItems: 'center' }}>
       <div style={{ ...cardStyle, borderTop: `5px solid ${subject?.color}` }} className="animate-pop">
@@ -137,7 +157,7 @@ export default function QuestScreen({
           {quest.storyIntro}
         </div>
         <div style={{ textAlign: 'center', color: '#64748b', fontSize: 13, marginBottom: 20 }}>
-          📝 {allQuestions.length - 1} Questions + ⚔️ Boss Challenge
+          📝 5 Questions + 🛡️ Mini Boss + ⚔️ Big Boss
         </div>
         <button
           onClick={onBeginQuest}
@@ -157,12 +177,37 @@ export default function QuestScreen({
     </div>
   )
 
+  // Boss kind drives label & color. Falls back to legacy isBoss for safety.
+  const bossKind = currentQ.kind === 'miniBoss' ? 'mini'
+                 : currentQ.kind === 'bigBoss' ? 'big'
+                 : (isBoss ? 'big' : null)
+
+  const bossLabel = bossKind === 'mini' ? '🛡️ MINI BOSS'
+                  : bossKind === 'big'  ? '⚔️ BIG BOSS'
+                  : null
+
+  const bossBadgeStyle = bossKind === 'mini'
+    ? { background: 'linear-gradient(135deg, #f97316, #f59e0b)', color: '#fff' }
+    : bossKind === 'big'
+      ? { background: 'linear-gradient(135deg, #dc2626, #9333ea)', color: '#fff' }
+      : { background: '#f1f5f9', color: '#475569' }
+
+  // Total module questions = first 5; bosses are positions 6 and 7.
+  // Progress label is "X / 5" while in modules; bosses get their own badge.
+  const moduleTotal = 5
+  const inModules = !bossKind && questStep >= 1 && questStep <= moduleTotal
+
   // Decide which follow-up to use:
-  //   - If we have an explanation with a transferQuestion (wrong-answer path), use that.
-  //   - Otherwise (correct-answer "let's go deeper"), fall back to the static followUp.
-  const useTransfer = explanation?.transferQuestion && explanation?.transferAnswer
+  //   - Wrong-answer path: explanation.transferQuestion (now MC)
+  //   - Correct-answer path: currentQ.followUp (legacy free-text "let's go deeper")
+  const useTransfer = !!(explanation?.transferQuestion)
+  const transferIsMC = useTransfer
+    && Array.isArray(explanation?.transferOptions)
+    && explanation.transferOptions.length === 4
+    && !!explanation.transferCorrect
+
   const followUpText   = useTransfer ? explanation.transferQuestion : currentQ.followUp
-  const followUpAnswer = useTransfer ? explanation.transferAnswer  : currentQ.followUpAnswer
+  const followUpAnswer = useTransfer ? (explanation.transferCorrect || explanation.transferAnswer) : currentQ.followUpAnswer
 
   // ── Question screen ──────────────────────────────────────────────────────
   return (
@@ -174,21 +219,20 @@ export default function QuestScreen({
             {subject?.emoji} {subject?.label}
           </span>
           <span style={{
-            background: isBoss ? 'linear-gradient(135deg, #dc2626, #9333ea)' : '#f1f5f9',
-            color: isBoss ? '#fff' : '#475569',
+            ...bossBadgeStyle,
             borderRadius: 20, padding: '3px 10px', fontSize: 12, fontWeight: 800,
           }}>
-            {isBoss ? '⚔️ BOSS' : `${questStep} / ${allQuestions.length - 1}`}
+            {bossLabel || `${questStep} / ${moduleTotal}`}
           </span>
         </div>
 
-        {/* Progress bar */}
-        {!isBoss && (
+        {/* Progress bar — only during modules, not bosses */}
+        {inModules && (
           <div style={{ height: 4, background: '#f1f5f9', borderRadius: 4, marginBottom: 20, overflow: 'hidden' }}>
             <div style={{
               height: '100%', borderRadius: 4,
               background: `linear-gradient(90deg, ${subject?.color}, ${subject?.color}88)`,
-              width: `${(questStep / (allQuestions.length - 1)) * 100}%`,
+              width: `${(questStep / moduleTotal) * 100}%`,
               transition: 'width 0.5s ease',
             }} />
           </div>
@@ -230,7 +274,7 @@ export default function QuestScreen({
           </FeedbackBox>
         )}
 
-        {/* Follow-up after correct (static) */}
+        {/* Follow-up after correct (static, free-text) */}
         {answerState === 'followup' && (
           <FeedbackBox color="#1e3a5f" bg="#eff6ff" border="#93c5fd">
             <div style={{ fontSize: 22, marginBottom: 4 }}>🧠 Let's go deeper!</div>
@@ -264,7 +308,7 @@ export default function QuestScreen({
           </FeedbackBox>
         )}
 
-        {/* Wrong + explanation + transfer follow-up */}
+        {/* Wrong + explanation + transfer follow-up (MC) */}
         {(answerState === 'wrong' || answerState === 'explanation') && (
           <FeedbackBox color="#92400e" bg="#fffbeb" border="#fcd34d">
             {answerState === 'wrong' && (
@@ -290,24 +334,62 @@ export default function QuestScreen({
                 }}>
                   {useTransfer ? '🎯 Apply it in a new way:' : 'Follow-up — lock it in:'}
                 </div>
-                <div style={{ fontSize: 14, color: '#334155', marginBottom: 8, textAlign: 'left' }}>
+                <div style={{ fontSize: 14, color: '#334155', marginBottom: 10, textAlign: 'left' }}>
                   {followUpText}
                 </div>
-                <input
-                  value={followupInput}
-                  onChange={e => onFollowupChange(e.target.value)}
-                  placeholder="Your answer…"
-                  style={inputStyle}
-                />
+
+                {/* Multiple-choice transfer (preferred path) */}
+                {transferIsMC && !followupChecked && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, textAlign: 'left' }}>
+                    {explanation.transferOptions.map((opt, i) => (
+                      <button
+                        key={i}
+                        onClick={() => onFollowupChange(opt)}
+                        style={{
+                          padding: '11px 14px', borderRadius: 10, textAlign: 'left',
+                          background: followupInput === opt ? '#fef3c7' : '#fff',
+                          border: `2px solid ${followupInput === opt ? '#f59e0b' : '#fcd34d'}`,
+                          fontSize: 14, color: '#1e293b', fontWeight: 600,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* Free-text fallback if MC unavailable */}
+                {!transferIsMC && !followupChecked && (
+                  <input
+                    value={followupInput}
+                    onChange={e => onFollowupChange(e.target.value)}
+                    placeholder="Your answer…"
+                    style={inputStyle}
+                  />
+                )}
+
                 {!followupChecked ? (
-                  <button onClick={onFollowupCheck} style={{ ...btnStyle('#d97706'), marginTop: 10, width: '100%' }}>
+                  <button
+                    onClick={onFollowupCheck}
+                    disabled={!followupInput}
+                    style={{
+                      ...btnStyle('#d97706'), marginTop: 10, width: '100%',
+                      opacity: followupInput ? 1 : 0.5,
+                    }}
+                  >
                     Check
                   </button>
                 ) : (
                   <div style={{ marginTop: 10 }}>
-                    <div style={{ fontSize: 13, color: '#475569', background: '#fff', borderRadius: 8, padding: '8px 12px', marginBottom: 10, textAlign: 'left' }}>
-                      <strong>Answer:</strong> {followUpAnswer}
+                    <div style={{ fontSize: 13, color: '#475569', background: '#fff', borderRadius: 8, padding: '8px 12px', marginBottom: 6, textAlign: 'left' }}>
+                      <strong>{transferIsMC ? 'Correct answer:' : 'Answer:'}</strong> {followUpAnswer}
                     </div>
+                    {transferIsMC && explanation.transferRationale && (
+                      <div style={{ fontSize: 13, color: '#475569', background: '#f8fafc', borderRadius: 8, padding: '8px 12px', marginBottom: 10, textAlign: 'left' }}>
+                        {explanation.transferRationale}
+                      </div>
+                    )}
                     <button onClick={onProceed} style={{ ...btnStyle('#059669'), width: '100%' }}>
                       Continue →
                     </button>
@@ -319,7 +401,7 @@ export default function QuestScreen({
         )}
       </div>
 
-      {/* Stretch overlay — shown when stretchOffer is set */}
+      {/* Stretch overlay */}
       {stretchOffer && (
         <StretchModal
           offer={stretchOffer}
@@ -328,6 +410,13 @@ export default function QuestScreen({
           onDismiss={onStretchDismiss}
         />
       )}
+
+      {/* Floating notepad — available on every quest, every subject */}
+      <Notepad
+        open={notepadOpen}
+        onToggle={() => setNotepadOpen(v => !v)}
+        subjectColor={subject?.color || '#6366f1'}
+      />
     </div>
   )
 }
@@ -458,7 +547,6 @@ function StretchModal({ offer, answered, onAnswer, onDismiss }) {
   )
 }
 
-// Skeleton for lesson while it loads (1-3s in practice)
 function LessonSkeleton({ color }) {
   const bar = (w) => ({
     height: 12, borderRadius: 6, width: w,
