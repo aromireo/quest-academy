@@ -88,6 +88,16 @@ export default async function handler(req, res) {
       }
     } catch (err) {
       summary.failed += 1;
+      // Capture first 3 errors verbatim so we can debug
+      if (!summary.errors) summary.errors = [];
+      if (summary.errors.length < 3) {
+        summary.errors.push({
+          subject: item.subject,
+          grade: item.grade,
+          message: err.message,
+          stack: (err.stack || '').split('\n').slice(0, 4).join(' | '),
+        });
+      }
       // On rate limit, bail out of the whole call so the user retries after the minute resets
       if (/rate.?limit/i.test(err.message) || /429/.test(err.message)) {
         const remaining = await countRemaining(db);
