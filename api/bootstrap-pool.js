@@ -15,6 +15,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 import { generateQuestAndLesson } from './_lib/generate.js';
 
 export const config = { maxDuration: 55 };
@@ -51,6 +52,7 @@ export default async function handler(req, res) {
 
   const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     auth: { persistSession: false },
+    realtime: { transport: ws },
   });
 
   const startedAt = Date.now();
