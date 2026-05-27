@@ -11,7 +11,22 @@
   ],
   "functions": {
     "api/claude.js": {
-      "maxDuration": 60
+      "maxDuration": 55
+    },
+    "api/pool.js": {
+      "maxDuration": 55
+    },
+    "api/bootstrap-pool.js": {
+      "maxDuration": 55
+    },
+    "api/cron-refill-pool.js": {
+      "maxDuration": 55
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron-refill-pool",
+      "schedule": "0 7 * * *"
+    }
+  ]
 }

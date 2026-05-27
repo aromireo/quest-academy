@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { SUBJECTS, BADGES, BASE_GRADE, STARTING_LEVELS, getLevel } from './lib/constants.js'
 import { loadProfiles, saveProfile, deleteProfile, saveQuestResult, loadQuestHistory } from './lib/supabase.js'
-import { generateQuest, generateExplanation, generateLesson, generateStretchQuestion, calcNextDifficulty } from './lib/claude.js'
+import { fetchPoolQuest, generateExplanation, generateStretchQuestion, calcNextDifficulty } from './lib/claude.js'
 import HomeScreen from './pages/HomeScreen.jsx'
 import SetupScreen from './pages/SetupScreen.jsx'
 import ProfileScreen from './pages/ProfileScreen.jsx'
@@ -13,10 +13,8 @@ import Notification from './components/Notification.jsx'
 import LoadingScreen from './components/LoadingScreen.jsx'
 
 // ── Household code: stable across devices, replaces per-browser session_id ──
-// Generates a friendly 8-char code like "QUEST-K7M4" the user can share between
-// devices. Old session_id is kept for one-time legacy migration.
 function generateHouseholdCode() {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // omit confusing chars
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
   let s = ''
   for (let i = 0; i < 4; i++) s += alphabet[Math.floor(Math.random() * alphabet.length)]
   return `QUEST-${s}`
@@ -37,8 +35,8 @@ export default function App() {
   const [householdCode, setHouseholdCodeState] = useState(getHouseholdCode())
   const [profiles, setProfiles]           = useState([])
   const [activeProfile, setActiveProfile] = useState(null)
-  const [setupSlot, setSetupSlot]         = useState(null)   // 0 or 1
-  const [editingProfile, setEditingProfile] = useState(null) // for profile edit flow
+  const [setupSlot, setSetupSlot]         = useState(null)
+  const [editingProfile, setEditingProfile] = useState(null)
 
   // Quest state
   const [quest, setQuest]                 = useState(null)
@@ -48,7 +46,7 @@ export default function App() {
   const [questError, setQuestError]       = useState(null)
   const [questStep, setQuestStep]         = useState(0)
   const [showLesson, setShowLesson]       = useState(false)
-  const [questReady, setQuestReady]       = useState(false) // questions arrived
+  const [questReady, setQuestReady]       = useState(false)
   const [answers, setAnswers]             = useState({})
   const [selectedAnswer, setSelectedAnswer] = useState(null)
   const [answerState, setAnswerState]     = useState(null)
@@ -57,27 +55,23 @@ export default function App() {
   const [followupInput, setFollowupInput] = useState('')
   const [followupChecked, setFollowupChecked] = useState(false)
   const [streak, setStreak]               = useState(0)
-  const [stretchOffer, setStretchOffer]   = useState(null) // { question, ... } | null
-  const [stretchAnswered, setStretchAnswered] = useState(null) // 'correct' | 'wrong' | null
+  const [stretchOffer, setStretchOffer]   = useState(null)
+  const [stretchAnswered, setStretchAnswered] = useState(null)
 
   const [questResults, setQuestResults]   = useState(null)
   const [notification, setNotification]   = useState(null)
   const [questHistory, setQuestHistory]   = useState([])
-  const [questCache, setQuestCache]       = useState({})
 
   // ── Boot: ensure household code exists, then load profiles ─────────────────
   useEffect(() => {
     ;(async () => {
       let code = getHouseholdCode()
       const legacy = getLegacySessionId()
-
-      // First-time install: brand new code
       if (!code) {
         code = generateHouseholdCode()
         setHouseholdCode(code)
         setHouseholdCodeState(code)
       }
-
       try {
         const data = await loadProfiles(code, legacy)
         setProfiles(data || [])
@@ -90,7 +84,6 @@ export default function App() {
     })()
   }, [])
 
-  // Allow parent to switch to an existing household code (multi-device sync)
   const switchHouseholdCode = useCallback(async (code) => {
     const cleanCode = code.trim().toUpperCase()
     if (!cleanCode) return false
@@ -100,53 +93,12 @@ export default function App() {
       const data = await loadProfiles(cleanCode, null)
       setProfiles(data || [])
       setActiveProfile(null)
-      setQuestCache({}) // reset cache when switching households
       return true
     } catch (e) {
       console.error('Failed to load profiles for code:', e)
       return false
     }
   }, [])
-
-  // ── Pre-load 3 quests per subject per profile in background ─────────────────
-  const CACHE_SIZE = 3
-  const SUBJECTS_TO_CACHE = ['math', 'english', 'science', 'history']
-
-  const getCacheKey = (profileId, subjectId) => `${profileId}_${subjectId}`
-
-  const fillCache = (profile) => {
-    if (!profile?.id || !profile?.name) return
-    const toLoad = []
-    SUBJECTS_TO_CACHE.forEach(subjectId => {
-      const subject = SUBJECTS.find(s => s.id === subjectId)
-      if (!subject) return
-      const key = getCacheKey(profile.id, subjectId)
-      toLoad.push({ subject, key })
-    })
-    toLoad.forEach(({ subject, key }, i) => {
-      setTimeout(() => {
-        setQuestCache(prev => {
-          const existing = prev[key] || []
-          if (existing.length >= CACHE_SIZE) return prev
-          generateQuest(subject, profile)
-            .then(q => setQuestCache(c => {
-              const cur = c[key] || []
-              if (cur.length >= CACHE_SIZE) return c
-              return { ...c, [key]: [...cur, q] }
-            }))
-            .catch(() => {})
-          return prev
-        })
-      }, i * 20000)
-    })
-  }
-
-  useEffect(() => {
-    if (profiles.length === 0) return
-    const first = profiles.find(p => p?.name && p.slot === 0)
-    if (first) fillCache(first)
-  }, [profiles.map(p => p?.id).join(',')])
-
 
   // ── Notifications ──────────────────────────────────────────────────────────
   const showNotif = useCallback((msg, emoji = '🎉', duration = 3000) => {
@@ -206,7 +158,6 @@ export default function App() {
 
   const completeSetup = async (data) => {
     if (editingProfile) {
-      // Edit mode — patch the existing profile
       const saved = await updateProfile({
         ...editingProfile,
         name: data.name,
@@ -226,7 +177,7 @@ export default function App() {
 
     const profile = {
       household_code: householdCode,
-      session_id: householdCode, // keep equal so legacy code paths still work
+      session_id: householdCode,
       slot: setupSlot,
       name: data.name,
       grade,
@@ -255,10 +206,10 @@ export default function App() {
   }
 
   // ── Quest flow ─────────────────────────────────────────────────────────────
+  // v11: this now hits the pool endpoint. Should return in <1s on a cache hit.
   const startQuest = async (subjectId) => {
     const subject = SUBJECTS.find(s => s.id === subjectId)
     setActiveSubject(subject)
-    setQuestLoading(true)
     setQuestError(null)
     setQuest(null)
     setLesson(null)
@@ -277,46 +228,20 @@ export default function App() {
     setStretchOffer(null)
     setStretchAnswered(null)
 
+    // Switch to quest screen immediately and show "preparing" while we fetch
+    setQuestLoading(true)
+    setScreen('quest')
+
     try {
-      const cacheKey = getCacheKey(activeProfile.id, subjectId)
-      const cachedArr = questCache[cacheKey] || []
-
-      // Switch to quest screen immediately so the lesson can render while
-      // questions are being prepared in the background.
-      setScreen('quest')
-      setQuestLoading(false)
-
-      // Always generate a fresh lesson (quick, ~2-3s) — gives the kid
-      // something to read while questions load
-      generateLesson(subject, activeProfile)
-        .then(setLesson)
-        .catch(() => setLesson(null))
-
-      if (cachedArr.length > 0) {
-        // Cache hit — questions ready instantly
-        const [next, ...rest] = cachedArr
-        setQuest(next)
-        setQuestReady(true)
-        setQuestCache(prev => ({ ...prev, [cacheKey]: rest }))
-        // Replenish cache in background after 20s
-        setTimeout(() => {
-          generateQuest(subject, activeProfile)
-            .then(q => setQuestCache(c => {
-              const cur = c[cacheKey] || []
-              if (cur.length >= CACHE_SIZE) return c
-              return { ...c, [cacheKey]: [...cur, q] }
-            }))
-            .catch(() => {})
-        }, 20000)
-        return
-      }
-
-      // Cache miss — generate now while lesson is showing
-      const q = await generateQuest(subject, activeProfile)
+      const { quest: q, lesson: l } = await fetchPoolQuest(subject, activeProfile)
       setQuest(q)
+      setLesson(l)
       setQuestReady(true)
+      setQuestLoading(false)
     } catch (err) {
-      setQuestError(err.message)
+      console.error('Quest fetch failed:', err)
+      setQuestError(err.message || 'Could not load quest. Please try again.')
+      setQuestLoading(false)
     }
   }
 
@@ -342,11 +267,7 @@ export default function App() {
       } else {
         setAnswerState('correct')
       }
-
-      // Offer a stretch question after every 3rd consecutive correct answer
-      // (only on regular questions — not boss, since boss already has follow-up)
       if (!isBoss && newStreak > 0 && newStreak % 3 === 0) {
-        // Fire-and-forget — UI shows when ready
         generateStretchQuestion(activeSubject, activeProfile).then(s => {
           if (s) setStretchOffer(s)
         }).catch(() => {})
@@ -369,7 +290,7 @@ export default function App() {
     const isCorrect = option.trim().toLowerCase() === (stretchOffer.correctAnswer || '').trim().toLowerCase()
     setStretchAnswered(isCorrect ? 'correct' : 'wrong')
     if (isCorrect) {
-      const updated = await addXP(activeProfile, 30) // bonus XP
+      const updated = await addXP(activeProfile, 30)
       await awardBadge(updated, 'stretch')
     }
   }
@@ -443,7 +364,6 @@ export default function App() {
           showNotif(`Difficulty increased in ${activeSubject.label}!`, '⬆️', 4000)
         }
       }
-
       const mathScores = history.filter(h => h.subject_id === 'math' && h.score >= 85)
       if (mathScores.length >= 3) prof = await awardBadge(prof, 'math_ace')
       const engScores = history.filter(h => h.subject_id === 'english' && h.score >= 85)
@@ -467,7 +387,6 @@ export default function App() {
           onSelectProfile={p => {
             setActiveProfile(p)
             setScreen('profile')
-            fillCache(p)
           }}
           onSetupProfile={startSetup}
           onParentDash={() => setScreen('parent')}
@@ -485,7 +404,6 @@ export default function App() {
             setHouseholdCodeState(code)
             setProfiles([])
             setActiveProfile(null)
-            setQuestCache({})
             setScreen('home')
           }}
           onBack={() => setScreen('home')}
