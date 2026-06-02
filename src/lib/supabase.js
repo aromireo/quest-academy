@@ -7,10 +7,7 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey)
 
 // ── Profile helpers ───────────────────────────────────────────────────────────
 
-// Load all profiles for a given household code (works across devices).
-// Falls back to legacy session_id lookup so existing users aren't stranded.
 export async function loadProfiles(householdCode, legacySessionId) {
-  // Primary lookup: household_code
   let { data, error } = await supabase
     .from('profiles')
     .select('*')
@@ -19,8 +16,6 @@ export async function loadProfiles(householdCode, legacySessionId) {
 
   if (error) throw error
 
-  // Fallback for legacy installs that haven't been migrated yet:
-  // if no rows found, try session_id and adopt it as the household code
   if ((!data || data.length === 0) && legacySessionId) {
     const legacy = await supabase
       .from('profiles')
@@ -29,13 +24,11 @@ export async function loadProfiles(householdCode, legacySessionId) {
       .order('slot')
     if (legacy.error) throw legacy.error
     if (legacy.data && legacy.data.length > 0) {
-      // Backfill household_code on these rows so future loads work directly
       await supabase
         .from('profiles')
         .update({ household_code: householdCode })
         .eq('session_id', legacySessionId)
         .is('household_code', null)
-      // Re-read with household_code set
       const reread = await supabase
         .from('profiles')
         .select('*')
@@ -67,6 +60,8 @@ export async function deleteProfile(profileId) {
   if (error) throw error
 }
 
+// v11: result object now includes optional `strand` field.
+// Shape: { profile_id, subject_id, subject_label, score, correct, total, difficulty, strand? }
 export async function saveQuestResult(result) {
   const { error } = await supabase
     .from('quest_results')

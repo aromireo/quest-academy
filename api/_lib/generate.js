@@ -1,14 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// /api/_lib/generate.js  —  server-side quest+lesson generation
-// Used by:
-//   - /api/pool.js (live fallback when pool is empty for a combo)
-//   - /api/bootstrap-pool.js (one-time initial pool fill)
-//   - /api/cron-refill-pool.js (bi-weekly refresh)
+// /api/_lib/generate.js  —  v11
+// Server-side quest+lesson generation.
 //
-// Important:
-//   - This generates GENERIC quests (no student name/pronouns baked in).
-//   - The client substitutes name/pronouns at render time using placeholders.
-//   - This is what makes the pool reusable across kids.
+// v11 changes:
+//   - Quest JSON now includes a `strand` field (tagged by Claude at generation)
+//   - Lesson prompts are richer: more depth, worked example, "why this matters
+//     at the next level" hook — appropriate for advanced/accelerated learners
+//   - Tone profile support: caller can pass toneProfile to adjust voice
+//     (used by live fallback; pool quests are generic, tone applied client-side)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
@@ -19,6 +18,14 @@ const SUBJECT_LABELS = {
   english: 'English / Language Arts',
   science: 'Science',
   history: 'History',
+};
+
+// Strand options passed into the prompt so Claude picks the closest match.
+const STRAND_OPTIONS = {
+  math:    ['Numbers & Operations','Fractions & Decimals','Algebra & Patterns','Geometry & Measurement','Statistics & Data','Real & Complex Numbers'],
+  english: ['Story & Character Analysis','Informational Text','Vocabulary in Context',"Author's Craft & Structure",'Argument & Evidence'],
+  science: ['Life Science','Earth Science','Physical Science','Scientific Method','Data & Experiments'],
+  history: ['Ancient & World History','U.S. History','Government & Civics','Geography & Culture','Historical Thinking'],
 };
 
 function difficultyLabel(level) {
@@ -89,31 +96,36 @@ function parseJson(text) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Generate a generic quest (no name/pronoun baked in)
+// Generate a generic quest (no name/pronoun baked in).
+// v11: now includes strand tagging.
 // ─────────────────────────────────────────────────────────────────────────────
 export async function generateQuest(subjectId, gradeLevel) {
   const subject = SUBJECT_LABELS[subjectId] || subjectId;
   const diff = difficultyLabel(gradeLevel);
+  const strandList = (STRAND_OPTIONS[subjectId] || []).join(', ');
 
   const system = `You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }.`;
 
   const prompt = `Generate a ${subject} quest at difficulty "${diff}".
 
-IMPORTANT: Match content to Grade ${gradeLevel} curriculum standards exactly. The student is genuinely working at this level — make questions challenging but fair.
+IMPORTANT: Match content to Grade ${gradeLevel} curriculum standards exactly. Students using this app are genuinely working at or above this level — make questions challenging, precise, and intellectually substantive. Avoid oversimplified or trivial questions.
 
 If any word problem features a student, refer to them as "the student" or use the placeholder {NAME}. Do not assume a name or gender. Use the placeholder {PRONOUN_SUBJECT} (they/he/she) and {PRONOUN_POSSESSIVE} (their/his/her) where pronouns are needed. The app replaces these at display time.
 
+STRAND: Pick the single best matching strand for this quest's concept from this list: ${strandList || 'use your judgment'}
+
 STRUCTURE:
 - Pick ONE focused concept appropriate for Grade ${gradeLevel} ${subject}.
-- ALL 7 questions in this quest must test that single concept (varying difficulty and angle).
+- ALL 7 questions must test that single concept (varying difficulty and angle).
 - 5 "module" questions: progressive practice (easier → medium).
 - 1 "miniBoss" question: synthesize multiple aspects of the concept.
-- 1 "bigBoss" question: apply the concept in a new context (transfer).
+- 1 "bigBoss" question: apply the concept in a genuinely new context (transfer).
 
 Output this exact JSON:
 {
   "concept": "Name of the focused concept (e.g. 'Linear equations with one variable')",
   "conceptSummary": "1 sentence describing what specifically is being tested",
+  "strand": "Exact strand label from the list above",
   "requiredKnowledge": ["term or unit 1", "term or unit 2", "..."],
   "questTitle": "fun adventure title",
   "storyIntro": "2 sentence story setup",
@@ -130,21 +142,20 @@ Output this exact JSON:
 }
 
 RULES:
-- "requiredKnowledge" lists every term, unit, formula, or vocabulary word that appears in any question (e.g. ["joules (J)", "kinetic energy formula", "mass in kg"]). The lesson will teach these BEFORE the student answers.
-- For science: if a question uses a unit (joules, newtons, m/s²) or formula, that unit/formula MUST appear in requiredKnowledge.
+- "requiredKnowledge" lists every term, unit, formula, or vocabulary word that appears in any question. The lesson will teach these BEFORE the student answers.
+- For science: if a question uses a unit or formula, it MUST appear in requiredKnowledge.
 - correctAnswer must exactly match one option string.
-- Make questions genuinely challenging at "${diff}" — these are accelerated learners.
-- Vary style: word problems, application, conceptual reasoning.
+- Questions should be genuinely challenging — these are advanced, accelerated learners.
+- Vary style: word problems, application, conceptual reasoning, data interpretation.
 - Output ONLY the JSON object.`;
 
   const result = await callClaude({ system, user: prompt, maxTokens: 2400 });
 
-  // Validate structure
   if (!result.modules || result.modules.length < 5 || !result.miniBoss || !result.bigBoss) {
     throw new Error('Generated quest missing required sections');
   }
 
-  // Normalize correctAnswer to match an option exactly
+  // Validate and normalize correctAnswer for every question
   const allQs = [...result.modules, result.miniBoss, result.bigBoss];
   for (const q of allQs) {
     if (!Array.isArray(q.options)) throw new Error('Question missing options array');
@@ -154,7 +165,7 @@ RULES:
     }
   }
 
-  // Tag kinds so the renderer knows boss types
+  // Tag kinds for renderer
   result.modules.forEach(q => { q.kind = 'module'; });
   result.miniBoss.kind = 'miniBoss';
   result.bigBoss.kind = 'bigBoss';
@@ -163,41 +174,54 @@ RULES:
   result.questions = [...result.modules, result.miniBoss];
   result.bossQuestion = result.bigBoss;
 
+  // Ensure strand is a string; fall back gracefully
+  if (!result.strand || typeof result.strand !== 'string') {
+    result.strand = (STRAND_OPTIONS[subjectId] || [])[0] || 'General';
+  }
+
   return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Generate a lesson tied to a specific quest's concept and required knowledge.
+// Generate a richer lesson tied to the quest's concept and required knowledge.
+// v11: deeper explanation, worked example, "why this matters" forward hook.
 // ─────────────────────────────────────────────────────────────────────────────
 export async function generateLesson(quest, subjectId, gradeLevel) {
   const subject = SUBJECT_LABELS[subjectId] || subjectId;
   const required = (quest.requiredKnowledge || []).join(', ');
+  const diff = difficultyLabel(gradeLevel);
 
-  const system = `You are a warm, witty tutor writing a pre-quest lesson. Output ONLY raw JSON. Be conversational, not textbook-y. Be warm and direct, never patronizing.`;
+  const system = `You are a sharp, direct tutor writing a pre-quest lesson for an advanced learner. Output ONLY raw JSON. Be substantive — explain the concept properly, not superficially. Assume the student is capable and curious. Do not pad with fluff or over-reassure.`;
 
-  const prompt = `Write the lesson card for a Grade ${gradeLevel} ${subject} quest.
+  const prompt = `Write the lesson card for a ${diff} ${subject} quest.
 
-The quest tests this exact concept: ${quest.concept}
-What's tested: ${quest.conceptSummary}
+The quest tests this concept: ${quest.concept}
+What's specifically tested: ${quest.conceptSummary}
+Terms, units, or formulas the student WILL ENCOUNTER: ${required || '(none specific)'}
 
-Terms, units, or formulas the student WILL ENCOUNTER in the questions: ${required || '(none specific)'}
-
-Your lesson MUST teach every term/unit/formula listed above so the student is never tested on something they weren't taught. If any unit (joules, newtons, m/s²) or formula appears in the list, define it clearly with what it measures and show how to use it.
+LESSON REQUIREMENTS:
+1. Teach every term/unit/formula listed above — define it clearly, show what it measures or means, and demonstrate how to use it.
+2. Include at least one concrete worked example that walks through the reasoning step by step.
+3. End with a brief "why this matters" note — connect the concept to something at the next level of study or a real application they'll actually encounter.
+4. Do not dumb it down. These are advanced learners encountering new-ish material. Explain it properly.
 
 Return JSON:
 {
   "topic": "Short topic name (≤ 5 words)",
-  "hook": "One opening sentence — fun fact, real-world connection, or 'why this matters'",
-  "lesson": "2-3 short paragraphs explaining the core concept clearly with one concrete worked example. Define every term in requiredKnowledge.",
-  "watchOut": "One sentence about a common mistake students make on this topic",
+  "hook": "One opening sentence — a compelling real-world connection, surprising fact, or genuine reason this concept matters",
+  "lesson": "3-4 short paragraphs: (1) core concept explained clearly, (2) worked example with step-by-step reasoning, (3) key nuances or conditions to know, (4) why this matters / what it connects to next",
+  "watchOut": "One sentence about the most common mistake students make on this specific concept",
   "keyTerms": [
-    {"term": "joules (J)", "definition": "the unit of energy; 1 J = energy to lift a small apple ~1m"}
+    {"term": "term name", "definition": "precise, useful definition — not vague"}
   ]
 }
 
-Keep total lesson length under 220 words. Include 1-5 keyTerms (only if requiredKnowledge had terms; otherwise empty array). Use "the student" or {NAME} placeholder if you refer to a student; do not assume a name. Output ONLY the JSON object.`;
+Total lesson length: 250-320 words (longer than before — depth matters here).
+Include 1-6 keyTerms covering everything in requiredKnowledge.
+Use "the student" or {NAME} placeholder if referring to a student. Do not assume a name.
+Output ONLY the JSON object.`;
 
-  const result = await callClaude({ system, user: prompt, maxTokens: 900 });
+  const result = await callClaude({ system, user: prompt, maxTokens: 1200 });
 
   return {
     topic: result.topic || quest.concept || subject,
@@ -210,7 +234,7 @@ Keep total lesson length under 220 words. Include 1-5 keyTerms (only if required
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generate both in one go (sequential — lesson needs the quest's required
-// knowledge). Used by the live-fallback path and bootstrap.
+// knowledge). Used by the live-fallback path and bootstrap/cron.
 // ─────────────────────────────────────────────────────────────────────────────
 export async function generateQuestAndLesson(subjectId, gradeLevel) {
   const quest = await generateQuest(subjectId, gradeLevel);

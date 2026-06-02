@@ -40,17 +40,63 @@ export const BADGES = [
 export const XP_PER_LEVEL = 250
 
 // Enrolled grade by slot (the grade they're actually in at school).
-export const BASE_GRADE = { '6th': 6, '3rd': 3 }
+export const BASE_GRADE = { '7th': 7, '4th': 4 }
 
-// Starting working levels per slot per subject (separate from enrolled grade).
-// These are the defaults for newly-created profiles. Existing profiles keep
-// whatever's in their difficulty_levels jsonb. Parents can override anytime
-// from the dashboard.
+// Starting working levels per slot per subject.
+// Updated for v11 based on MAP Spring 2026 scores:
+//   Slot 0 = Teniola (incoming 7th grade): MAP Math 258 RIT / Reading 227 RIT — all subjects Grade 8
+//   Slot 1 = Moyo (incoming 4th grade): MAP Math 235 RIT (exceptional growth) / Reading 226 RIT — all subjects Grade 5
 export const STARTING_LEVELS = {
-  // Slot 0 = older kid (Teniola): doing 8th grade math, ~7th in others
-  0: { math: 8, english: 7, science: 7, history: 7 },
-  // Slot 1 = younger kid (Moyo): doing 4th grade across the board (accelerated)
-  1: { math: 4, english: 4, science: 4, history: 4 },
+  0: { math: 8, english: 8, science: 8, history: 8 },
+  1: { math: 5, english: 5, science: 5, history: 5 },
+}
+
+// Strand labels by subject — used for quest tagging and parent dashboard breakdown.
+// These map to MAP Growth goal strands for cross-referencing over time.
+export const STRANDS = {
+  math: [
+    'Numbers & Operations',
+    'Fractions & Decimals',
+    'Algebra & Patterns',
+    'Geometry & Measurement',
+    'Statistics & Data',
+    'Real & Complex Numbers',
+  ],
+  english: [
+    'Story & Character Analysis',
+    'Informational Text',
+    'Vocabulary in Context',
+    "Author's Craft & Structure",
+    'Argument & Evidence',
+  ],
+  science: [
+    'Life Science',
+    'Earth Science',
+    'Physical Science',
+    'Scientific Method',
+    'Data & Experiments',
+  ],
+  history: [
+    'Ancient & World History',
+    'U.S. History',
+    'Government & Civics',
+    'Geography & Culture',
+    'Historical Thinking',
+  ],
+}
+
+// Tone profiles per slot.
+// Slot 0 (Teniola, incoming 7th): peer-level, intellectually direct, no hand-holding.
+// Slot 1 (Moyo, incoming 4th): warm and encouraging, age-appropriate energy.
+export const TONE_PROFILES = {
+  0: {
+    style: 'peer',
+    instructions: `Tone: direct and intellectually serious. Treat the student as a capable young adult. No exclamation points in praise. No baby-ish affirmations. Light wit is fine. Skip the hand-holding — get to the point. Never say things like "Great job!", "Amazing!", "You're so smart!" Academic but not stuffy.`,
+  },
+  1: {
+    style: 'warm',
+    instructions: `Tone: warm, encouraging, and age-appropriate. Celebrate effort genuinely without being over-the-top. Friendly energy is good. Clear and simple language.`,
+  },
 }
 
 export function getLevel(xp)        { return Math.floor((xp || 0) / XP_PER_LEVEL) + 1 }

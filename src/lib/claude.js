@@ -1,15 +1,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // src/lib/claude.js  —  v11
 //
-// Big change from v10:
-//   - Quest + lesson NO LONGER generated live in the client. They come from the
-//     pre-generated pool (see /api/pool.js). Loads in <1 second.
-//   - Live explanations (for wrong answers) and stretch questions still
-//     generate on demand, because they're personalized per attempt.
-//
-// All Claude calls now use Sonnet by default with automatic Haiku fallback on
-// timeout/rate-limit. Haiku is ~3-4x faster and good enough for explanations
-// and stretch questions.
+// v11 changes:
+//   - Tone profile injected into explanation + stretch prompts based on profile slot
+//   - Strand passed through on explanation calls (for future misconception tagging)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const PROXY_URL = '/api/claude';
@@ -18,14 +12,30 @@ const POOL_URL = '/api/pool';
 const MODEL_PRIMARY = 'claude-sonnet-4-6';
 const MODEL_FALLBACK = 'claude-haiku-4-5';
 
-// ── Placeholder substitution (kids see their own name/pronouns in pool quests) ─
+// ── Tone profiles (mirrors constants.js — duplicated here for server-side use) ─
+const TONE_PROFILES = {
+  0: {
+    style: 'peer',
+    instructions: `Tone: direct and intellectually serious. Treat the student as a capable young adult. No exclamation points in praise. No baby-ish affirmations. Light wit is fine. Skip the hand-holding — get to the point. Never say things like "Great job!", "Amazing!", "You're so smart!" Academic but not stuffy.`,
+  },
+  1: {
+    style: 'warm',
+    instructions: `Tone: warm, encouraging, and age-appropriate. Celebrate effort genuinely without being over-the-top. Friendly energy is good. Clear and simple language.`,
+  },
+};
+
+function getToneInstructions(profile) {
+  const slot = profile?.slot ?? 1;
+  return TONE_PROFILES[slot]?.instructions || TONE_PROFILES[1].instructions;
+}
+
+// ── Placeholder substitution ──────────────────────────────────────────────────
 function personalize(text, profile) {
   if (typeof text !== 'string') return text;
   const name = profile?.name || 'the student';
   const pronouns = profile?.pronouns || 'they/them';
   const subj = (pronouns.split('/')[0] || 'they').trim();
   const obj  = (pronouns.split('/')[1] || subj).trim();
-  // Simple possessive guess: he→his, she→her, they→their
   const possMap = { he: 'his', she: 'her', they: 'their' };
   const poss = possMap[subj.toLowerCase()] || `${obj}'s`;
   return text
@@ -71,7 +81,7 @@ function personalizeLesson(lesson, profile) {
   };
 }
 
-// ── Pool fetch (the new fast path) ────────────────────────────────────────────
+// ── Pool fetch ────────────────────────────────────────────────────────────────
 export async function fetchPoolQuest(subject, profile) {
   const gradeLevel = profile?.difficulty_levels?.[subject?.id] || profile?.base_grade_num || 6;
   const r = await fetch(POOL_URL, {
@@ -141,11 +151,10 @@ async function callClaude({ system, user, maxTokens = 800 }) {
     const data = await callClaudeRaw({
       model: MODEL_PRIMARY,
       system, user, maxTokens,
-      timeoutMs: 25_000, // short — fallback to Haiku quickly
+      timeoutMs: 25_000,
     });
     return extractJson(data);
   } catch (primaryErr) {
-    // Auto-fallback to Haiku on timeout, rate limit, or overload
     const shouldFallback =
       primaryErr.code === 'client_timeout' ||
       primaryErr.code === 'upstream_timeout' ||
@@ -172,22 +181,24 @@ function extractJson(data) {
   catch { return JSON.parse(j.replace(/,\s*([}\]])/g, '$1').replace(/[\u0000-\u001F]/g, ' ')); }
 }
 
-// ── Explanation + MC transfer (when kid gets one wrong) ──────────────────────
+// ── Explanation + MC transfer (when kid gets one wrong) ───────────────────────
 export async function generateExplanation(question, wrongAnswer, correctAnswer, profile, subject) {
   const workingLevel = profile?.difficulty_levels?.[subject?.id] || profile?.base_grade_num || 6;
   const name = profile?.name || 'the student';
   const pronouns = profile?.pronouns || 'they/them';
+  const toneInstructions = getToneInstructions(profile);
 
-  const system = `You are a warm, direct tutor for ${name}, a Grade ${workingLevel} student.
+  const system = `You are a tutor for ${name}, a Grade ${workingLevel} student.
 Output ONLY a valid JSON object, no markdown.
 
-TONE RULES (CRITICAL):
-- Be warm but never sycophantic.
+${toneInstructions}
+
+ADDITIONAL TONE RULES (CRITICAL):
+- Be direct. Never sycophantic.
 - Do NOT flatter or praise the student's intelligence, confidence, ability, or effort.
-- BANNED phrases (do not use these or close variants): "you clearly", "real confidence", "you obviously", "great thinking", "you're so close", "smart move", "you've got this", "amazing work", "love how you", "I can tell you".
-- "Good try" or "Nice attempt" are fine. One short acknowledgment max.
-- Get to the explanation fast. The student wants to understand the error, not be cheered on.
-- Use ${pronouns} pronouns when addressing or describing the student.`;
+- BANNED phrases: "you clearly", "real confidence", "you obviously", "great thinking", "you're so close", "smart move", "you've got this", "amazing work", "love how you", "I can tell you".
+- One short acknowledgment max — then get to the explanation.
+- Use ${pronouns} pronouns when referring to the student.`;
 
   const prompt = `${name} is working on ${subject.label} at Grade ${workingLevel} level.
 
@@ -196,22 +207,22 @@ ${name.toUpperCase()}'S ANSWER (wrong): ${wrongAnswer}
 CORRECT ANSWER: ${correctAnswer}
 
 Step 1: Identify the SPECIFIC misconception revealed by the wrong answer.
-Step 2: Write a brief, warm-but-direct explanation of why the correct answer is right and where the wrong answer went off track.
+Step 2: Write a brief explanation of why the correct answer is right and exactly where the wrong answer went off track.
 Step 3: Generate a multiple-choice "lock it in" question that tests the SAME UNDERSTANDING in a NEW context (different scenario, different numbers, different application — NOT just the same problem reskinned).
 
 Return JSON:
 {
   "encouragement": "One short, non-flattering acknowledgment (≤ 10 words)",
-  "explanation": "2-3 sentences. State why the correct answer is right and what specifically went wrong in the chosen answer.",
-  "memoryTip": "A clever trick, pattern, or hook to remember this concept (1 sentence)",
-  "transferQuestion": "A NEW multiple-choice question in a DIFFERENT context that tests the same understanding.",
+  "explanation": "2-3 sentences. State why the correct answer is right and what specifically went wrong.",
+  "memoryTip": "A concrete trick, pattern, or hook to remember this concept (1 sentence)",
+  "transferQuestion": "A NEW multiple-choice question in a DIFFERENT context testing the same understanding",
   "transferOptions": ["A) ...", "B) ...", "C) ...", "D) ..."],
-  "transferCorrect": "the exact string of the correct option",
+  "transferCorrect": "exact string of the correct option",
   "transferRationale": "1 sentence — why the correct option is correct"
 }
 
 DISTRACTOR RULES for transferOptions:
-- Each wrong option should reflect a plausible misconception (sign error, off-by-one, unit confusion, formula mix-up). NOT random noise.
+- Each wrong option should reflect a plausible misconception (sign error, off-by-one, unit confusion, formula mix-up). Not random noise.
 - transferCorrect MUST exactly match one of the four option strings.
 
 Output ONLY the JSON object.`;
@@ -230,7 +241,7 @@ Output ONLY the JSON object.`;
       transferCorrect = null;
     }
     return {
-      encouragement: result.encouragement || "Good try — let's break it down.",
+      encouragement: result.encouragement || "Let's break that down.",
       explanation: result.explanation || `The correct answer is: ${correctAnswer}.`,
       memoryTip: result.memoryTip || 'Review this concept and it will stick next time.',
       transferQuestion: result.transferQuestion || null,
@@ -240,7 +251,7 @@ Output ONLY the JSON object.`;
     };
   } catch {
     return {
-      encouragement: "Good try — let's break it down.",
+      encouragement: "Let's break that down.",
       explanation: `The correct answer is: ${correctAnswer}.`,
       memoryTip: 'Review this concept and it will stick next time.',
       transferQuestion: null,
@@ -251,14 +262,16 @@ Output ONLY the JSON object.`;
   }
 }
 
-// ── Stretch question (one grade above current level) ─────────────────────────
+// ── Stretch question (one grade above current level) ──────────────────────────
 export async function generateStretchQuestion(subject, profile) {
   const workingLevel = profile?.difficulty_levels?.[subject?.id] || profile?.base_grade_num || 6;
   const stretchLevel = Math.min(workingLevel + 1, 12);
   const name = profile?.name || 'the student';
   const pronouns = profile?.pronouns || 'they/them';
+  const toneInstructions = getToneInstructions(profile);
 
-  const system = `You are a quiz generator. Output ONLY raw JSON.`;
+  const system = `You are a quiz generator. Output ONLY raw JSON.\n\n${toneInstructions}`;
+
   const prompt = `Generate a single STRETCH question — one grade above the student's normal work — to reward a correct streak.
 
 Student: ${name}, pronouns ${pronouns}

@@ -341,6 +341,7 @@ export default function App() {
         correct,
         total,
         difficulty:    prof.difficulty_levels?.[activeSubject.id] || prof.base_grade_num,
+	strand: quest?.strand || null,
       })
     } catch (e) { console.error('Failed to save result:', e) }
 

@@ -1,18 +1,19 @@
 import { useEffect, useState } from 'react'
-import { SUBJECTS, HERO_CLASSES } from '../lib/constants.js'
+import { SUBJECTS, HERO_CLASSES, STRANDS } from '../lib/constants.js'
 
-const PARENT_PIN = '7326' // Change this to your preferred PIN
+const PARENT_PIN = '7326'
 
 export default function ParentScreen({
   profiles, questHistory, householdCode,
   onLoadHistory, onUpdateProfile, onEditProfile, onDeleteProfile,
   onBack, showNotif,
 }) {
-  const [unlocked, setUnlocked] = useState(false)
-  const [pin, setPin]           = useState('')
-  const [pinError, setPinError] = useState(false)
-  const [busySubj, setBusySubj] = useState(null) // `${profileId}_${subjectId}`
-  const [confirmDelete, setConfirmDelete] = useState(null) // profileId
+  const [unlocked, setUnlocked]       = useState(false)
+  const [pin, setPin]                 = useState('')
+  const [pinError, setPinError]       = useState(false)
+  const [busySubj, setBusySubj]       = useState(null)
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [copied, setCopied]           = useState(null) // profileId of last copied export
 
   const checkPin = () => {
     if (pin === PARENT_PIN) { setUnlocked(true); setPinError(false) }
@@ -22,6 +23,108 @@ export default function ParentScreen({
   useEffect(() => {
     if (unlocked) profiles.forEach(p => { if (p?.id) onLoadHistory(p.id) })
   }, [unlocked, profiles.map(p => p?.id).join(',')])
+
+  // ── Export progress report ──────────────────────────────────────────────────
+  const exportReport = (profile) => {
+    const history = questHistory.filter(h => h.profile_id === profile.id)
+    const now = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+
+    const lines = []
+    lines.push(`QUEST ACADEMY — PROGRESS REPORT`)
+    lines.push(`Kid: ${profile.name} | Generated: ${now}`)
+    lines.push(`Household: ${householdCode || '—'}`)
+    lines.push(`Enrolled Grade: ${profile.grade} | App Level: ${profile.level || 1} | XP: ${profile.xp || 0}`)
+    lines.push(`Badges: ${(profile.badges || []).join(', ') || 'none'}`)
+    lines.push('')
+
+    // Working levels
+    lines.push(`── WORKING LEVELS ──`)
+    SUBJECTS.forEach(s => {
+      const lvl = profile.difficulty_levels?.[s.id] || profile.base_grade_num
+      const locked = !!(profile.difficulty_locked || {})[s.id]
+      lines.push(`  ${s.label}: Grade ${lvl}${locked ? ' (locked)' : ' (auto)'}`)
+    })
+    lines.push('')
+
+    // Overall stats
+    const coreHistory = history.filter(h => ['math','english','science','history'].includes(h.subject_id))
+    if (coreHistory.length > 0) {
+      const overallAvg = Math.round(coreHistory.reduce((s, h) => s + h.score, 0) / coreHistory.length)
+      lines.push(`── OVERALL ──`)
+      lines.push(`  Total quests: ${coreHistory.length} | Overall avg: ${overallAvg}%`)
+      lines.push('')
+    }
+
+    // Performance by subject + strand breakdown
+    lines.push(`── PERFORMANCE BY SUBJECT & STRAND ──`)
+    SUBJECTS.forEach(s => {
+      const subHistory = history.filter(h => h.subject_id === s.id)
+      if (subHistory.length === 0) return
+
+      const subAvg = Math.round(subHistory.reduce((a, h) => a + h.score, 0) / subHistory.length)
+      lines.push(`  ${s.label}: ${subAvg}% avg (${subHistory.length} quests)`)
+
+      // Strand breakdown
+      const byStrand = {}
+      subHistory.forEach(h => {
+        if (h.strand) {
+          if (!byStrand[h.strand]) byStrand[h.strand] = []
+          byStrand[h.strand].push(h.score)
+        }
+      })
+      if (Object.keys(byStrand).length > 0) {
+        Object.entries(byStrand)
+          .sort((a, b) => {
+            const avgA = a[1].reduce((x, y) => x + y, 0) / a[1].length
+            const avgB = b[1].reduce((x, y) => x + y, 0) / b[1].length
+            return avgA - avgB // weakest first
+          })
+          .forEach(([strand, scores]) => {
+            const avg = Math.round(scores.reduce((x, y) => x + y, 0) / scores.length)
+            const flag = avg < 65 ? ' ⚠️' : avg >= 85 ? ' ✓' : ''
+            lines.push(`    · ${strand}: ${avg}% (${scores.length} quest${scores.length > 1 ? 's' : ''})${flag}`)
+          })
+      }
+      lines.push('')
+    })
+
+    // Difficulty progression (last 10 quests per subject)
+    lines.push(`── DIFFICULTY PROGRESSION (recent) ──`)
+    SUBJECTS.forEach(s => {
+      const subHistory = history
+        .filter(h => h.subject_id === s.id)
+        .slice(0, 10)
+        .reverse()
+      if (subHistory.length === 0) return
+      const levels = subHistory.map(h => `Gr${h.difficulty}`).join(' → ')
+      lines.push(`  ${s.label}: ${levels}`)
+    })
+    lines.push('')
+
+    // Recent quests
+    lines.push(`── RECENT QUESTS (last 15) ──`)
+    coreHistory.slice(0, 15).forEach(h => {
+      const sub = SUBJECTS.find(s => s.id === h.subject_id)
+      const date = new Date(h.created_at).toLocaleDateString()
+      const strand = h.strand ? ` [${h.strand}]` : ''
+      lines.push(`  ${sub?.label || h.subject_id}${strand} | Gr${h.difficulty} | ${h.score}% | ${date}`)
+    })
+    lines.push('')
+    lines.push(`── END OF REPORT ──`)
+    lines.push(`Paste this into a new Claude chat and ask for a retro assessment.`)
+
+    const text = lines.join('\n')
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(profile.id)
+      showNotif?.('Report copied to clipboard', '📋', 2500)
+      setTimeout(() => setCopied(null), 3000)
+    }).catch(() => {
+      // Fallback: open in new tab as plain text
+      const blob = new Blob([text], { type: 'text/plain' })
+      const url = URL.createObjectURL(blob)
+      window.open(url, '_blank')
+    })
+  }
 
   // PIN lock screen
   if (!unlocked) return (
@@ -92,40 +195,36 @@ export default function ParentScreen({
           📊 Parent Dashboard
         </h2>
 
-        {/* Household code reminder */}
         {householdCode && (
-          <div style={{
-            textAlign: 'center', fontSize: 11, color: 'var(--text-muted)',
-            marginBottom: 24, letterSpacing: 1.5, fontWeight: 700,
-          }}>
+          <div style={{ textAlign: 'center', fontSize: 11, color: 'var(--text-muted)', marginBottom: 24, letterSpacing: 1.5, fontWeight: 700 }}>
             HOUSEHOLD: {householdCode}
           </div>
         )}
 
         {profiles.filter(p => p?.name).length === 0 && (
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', marginTop: 40 }}>
-            No profiles set up yet.
-          </div>
+          <div style={{ textAlign: 'center', color: 'var(--text-muted)', marginTop: 40 }}>No profiles set up yet.</div>
         )}
 
         {profiles.filter(p => p?.name).map(profile => {
           const heroClass = HERO_CLASSES.find(h => h.id === profile.hero_class)
           const history = questHistory.filter(h => h.profile_id === profile.id)
-          const avg = history.length
-            ? Math.round(history.reduce((s, h) => s + h.score, 0) / history.length)
+          const coreHistory = history.filter(h => ['math','english','science','history'].includes(h.subject_id))
+          const avg = coreHistory.length
+            ? Math.round(coreHistory.reduce((s, h) => s + h.score, 0) / coreHistory.length)
             : null
 
           const bySubject = {}
-          history.forEach(h => {
-            if (!bySubject[h.subject_id]) bySubject[h.subject_id] = []
-            bySubject[h.subject_id].push(h.score)
+          coreHistory.forEach(h => {
+            if (!bySubject[h.subject_id]) bySubject[h.subject_id] = { scores: [], strands: {} }
+            bySubject[h.subject_id].scores.push(h.score)
+            if (h.strand) {
+              if (!bySubject[h.subject_id].strands[h.strand]) bySubject[h.subject_id].strands[h.strand] = []
+              bySubject[h.subject_id].strands[h.strand].push(h.score)
+            }
           })
 
           const weakSubjects = Object.entries(bySubject)
-            .filter(([id, scores]) =>
-              ['math','english','science','history'].includes(id) &&
-              scores.reduce((a, b) => a + b, 0) / scores.length < 65
-            )
+            .filter(([, { scores }]) => scores.reduce((a, b) => a + b, 0) / scores.length < 65)
             .map(([id]) => SUBJECTS.find(s => s.id === id)?.label || id)
 
           return (
@@ -146,56 +245,48 @@ export default function ParentScreen({
                     Pronouns: {profile.pronouns || 'they/them'}
                   </div>
                 </div>
-                <div style={{
-                  background: '#eef2ff', color: '#6366f1', borderRadius: 8,
-                  padding: '4px 12px', fontWeight: 800, fontSize: 14,
-                }}>
+                <div style={{ background: '#eef2ff', color: '#6366f1', borderRadius: 8, padding: '4px 12px', fontWeight: 800, fontSize: 14 }}>
                   {profile.xp || 0} XP
                 </div>
               </div>
 
-              {/* Edit / delete row */}
+              {/* Action row */}
               <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
                 <button
                   onClick={() => onEditProfile(profile)}
-                  style={{
-                    flex: 2, padding: '8px', background: '#eef2ff',
-                    color: '#6366f1', borderRadius: 8, fontWeight: 800, fontSize: 12,
-                  }}
+                  style={{ flex: 2, padding: '8px', background: '#eef2ff', color: '#6366f1', borderRadius: 8, fontWeight: 800, fontSize: 12 }}
                 >
                   ✏️ Edit Hero
                 </button>
                 <button
-                  onClick={() => setConfirmDelete(profile.id)}
+                  onClick={() => exportReport(profile)}
                   style={{
-                    flex: 1, padding: '8px', background: '#fef2f2',
-                    color: '#dc2626', borderRadius: 8, fontWeight: 800, fontSize: 12,
+                    flex: 2, padding: '8px',
+                    background: copied === profile.id ? '#d1fae5' : '#f0fdf4',
+                    color: copied === profile.id ? '#065f46' : '#059669',
+                    borderRadius: 8, fontWeight: 800, fontSize: 12,
+                    transition: 'all 0.2s',
                   }}
                 >
-                  🗑️ Delete
+                  {copied === profile.id ? '✓ Copied!' : '📋 Export Report'}
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(profile.id)}
+                  style={{ flex: 1, padding: '8px', background: '#fef2f2', color: '#dc2626', borderRadius: 8, fontWeight: 800, fontSize: 12 }}
+                >
+                  🗑️
                 </button>
               </div>
 
               {/* Delete confirmation */}
               {confirmDelete === profile.id && (
-                <div style={{
-                  background: '#fef2f2', border: '2px solid #fca5a5', borderRadius: 12,
-                  padding: 14, marginBottom: 18,
-                }}>
-                  <div style={{ color: '#991b1b', fontWeight: 800, marginBottom: 6, fontSize: 14 }}>
-                    Delete {profile.name}?
-                  </div>
+                <div style={{ background: '#fef2f2', border: '2px solid #fca5a5', borderRadius: 12, padding: 14, marginBottom: 18 }}>
+                  <div style={{ color: '#991b1b', fontWeight: 800, marginBottom: 6, fontSize: 14 }}>Delete {profile.name}?</div>
                   <div style={{ color: '#7f1d1d', fontSize: 12, marginBottom: 10, lineHeight: 1.4 }}>
-                    All quest history and progress will be permanently deleted.
-                    This can't be undone.
+                    All quest history and progress will be permanently deleted. This can't be undone.
                   </div>
                   <div style={{ display: 'flex', gap: 8 }}>
-                    <button
-                      onClick={() => setConfirmDelete(null)}
-                      style={{ flex: 1, padding: '8px', background: '#fff', color: '#475569', borderRadius: 8, fontWeight: 700, fontSize: 12, border: '1px solid #e2e8f0' }}
-                    >
-                      Cancel
-                    </button>
+                    <button onClick={() => setConfirmDelete(null)} style={{ flex: 1, padding: '8px', background: '#fff', color: '#475569', borderRadius: 8, fontWeight: 700, fontSize: 12, border: '1px solid #e2e8f0' }}>Cancel</button>
                     <button
                       onClick={async () => { await onDeleteProfile(profile.id); setConfirmDelete(null); showNotif?.('Profile deleted', '🗑️', 2000) }}
                       style={{ flex: 1, padding: '8px', background: '#dc2626', color: '#fff', borderRadius: 8, fontWeight: 800, fontSize: 12 }}
@@ -209,7 +300,7 @@ export default function ParentScreen({
               {/* Stats */}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 16 }}>
                 {[
-                  { label: 'Quests',    value: history.length },
+                  { label: 'Quests',    value: coreHistory.length },
                   { label: 'Avg Score', value: avg !== null ? `${avg}%` : '—' },
                   { label: 'Badges',    value: (profile.badges || []).length },
                   { label: 'Streak 🔥', value: profile.streak || 0 },
@@ -221,52 +312,27 @@ export default function ParentScreen({
                 ))}
               </div>
 
-              {/* Difficulty levels — now interactive */}
+              {/* Difficulty levels */}
               <div style={{ marginBottom: 16 }}>
-                <div style={{ fontWeight: 700, fontSize: 13, color: '#475569', marginBottom: 8 }}>
-                  Difficulty Per Subject
-                </div>
+                <div style={{ fontWeight: 700, fontSize: 13, color: '#475569', marginBottom: 8 }}>Difficulty Per Subject</div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {SUBJECTS.map(s => {
                     const lvl = profile.difficulty_levels?.[s.id] || profile.base_grade_num
                     const isLocked = !!(profile.difficulty_locked || {})[s.id]
                     const busy = busySubj === `${profile.id}_${s.id}`
                     return (
-                      <div key={s.id} style={{
-                        display: 'flex', alignItems: 'center', gap: 8,
-                        background: '#f8fafc', borderRadius: 10, padding: '8px 12px',
-                      }}>
+                      <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#f8fafc', borderRadius: 10, padding: '8px 12px' }}>
                         <span style={{ fontSize: 18 }}>{s.emoji}</span>
                         <span style={{ flex: 1, fontWeight: 700, fontSize: 13 }}>{s.label}</span>
-                        <button
-                          onClick={() => adjustDifficulty(profile, s.id, -1)}
-                          disabled={busy || lvl <= 1}
-                          style={diffBtnStyle}
-                        >
-                          −
-                        </button>
-                        <span style={{
-                          background: `${s.color}22`, color: s.color,
-                          borderRadius: 6, padding: '3px 10px', fontWeight: 800, fontSize: 12,
-                          minWidth: 50, textAlign: 'center',
-                        }}>
+                        <button onClick={() => adjustDifficulty(profile, s.id, -1)} disabled={busy || lvl <= 1} style={diffBtnStyle}>−</button>
+                        <span style={{ background: `${s.color}22`, color: s.color, borderRadius: 6, padding: '3px 10px', fontWeight: 800, fontSize: 12, minWidth: 50, textAlign: 'center' }}>
                           Gr {lvl}
                         </span>
-                        <button
-                          onClick={() => adjustDifficulty(profile, s.id, +1)}
-                          disabled={busy || lvl >= 12}
-                          style={diffBtnStyle}
-                        >
-                          +
-                        </button>
+                        <button onClick={() => adjustDifficulty(profile, s.id, +1)} disabled={busy || lvl >= 12} style={diffBtnStyle}>+</button>
                         <button
                           onClick={() => toggleLock(profile, s.id)}
-                          title={isLocked ? 'Locked: app won\'t auto-adjust' : 'Auto-adjusting'}
-                          style={{
-                            background: isLocked ? '#fef3c7' : 'transparent',
-                            border: 'none', fontSize: 14, cursor: 'pointer',
-                            padding: 4, borderRadius: 6,
-                          }}
+                          title={isLocked ? "Locked: app won't auto-adjust" : 'Auto-adjusting'}
+                          style={{ background: isLocked ? '#fef3c7' : 'transparent', border: 'none', fontSize: 14, cursor: 'pointer', padding: 4, borderRadius: 6 }}
                         >
                           {isLocked ? '🔒' : '🔓'}
                         </button>
@@ -279,32 +345,57 @@ export default function ParentScreen({
                 </div>
               </div>
 
-              {/* Weak areas */}
+              {/* Weak area alert */}
               {weakSubjects.length > 0 && (
-                <div style={{
-                  background: '#fff7ed', borderRadius: 8, padding: '10px 14px',
-                  color: '#92400e', fontSize: 13, marginBottom: 16,
-                }}>
+                <div style={{ background: '#fff7ed', borderRadius: 8, padding: '10px 14px', color: '#92400e', fontSize: 13, marginBottom: 16 }}>
                   ⚠️ <strong>Needs Practice:</strong> {weakSubjects.join(', ')}
                 </div>
               )}
 
-              {/* Subject breakdown */}
+              {/* Performance by subject + strand breakdown */}
               {Object.entries(bySubject).length > 0 && (
                 <div style={{ marginBottom: 16 }}>
-                  <div style={{ fontWeight: 700, fontSize: 13, color: '#475569', marginBottom: 8 }}>Performance by Subject</div>
-                  {Object.entries(bySubject).filter(([subId]) => ['math','english','science','history'].includes(subId)).map(([subId, scores]) => {
+                  <div style={{ fontWeight: 700, fontSize: 13, color: '#475569', marginBottom: 8 }}>Performance by Subject & Strand</div>
+                  {Object.entries(bySubject).map(([subId, { scores, strands }]) => {
                     const subInfo = SUBJECTS.find(s => s.id === subId)
                     const subAvg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
                     const barColor = subAvg >= 80 ? '#10b981' : subAvg >= 60 ? '#f59e0b' : '#ef4444'
+                    const strandEntries = Object.entries(strands)
+                      .sort((a, b) => {
+                        const avgA = a[1].reduce((x, y) => x + y, 0) / a[1].length
+                        const avgB = b[1].reduce((x, y) => x + y, 0) / b[1].length
+                        return avgA - avgB
+                      })
                     return (
-                      <div key={subId} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-                        <span style={{ fontSize: 16, width: 24 }}>{subInfo?.emoji}</span>
-                        <span style={{ flex: 1, fontSize: 13, color: '#334155' }}>{subInfo?.label}</span>
-                        <div style={{ width: 80, height: 8, background: '#e2e8f0', borderRadius: 4, overflow: 'hidden' }}>
-                          <div style={{ height: '100%', width: `${subAvg}%`, background: barColor, borderRadius: 4 }} />
+                      <div key={subId} style={{ marginBottom: 12 }}>
+                        {/* Subject row */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: strandEntries.length > 0 ? 6 : 0 }}>
+                          <span style={{ fontSize: 16, width: 24 }}>{subInfo?.emoji}</span>
+                          <span style={{ flex: 1, fontSize: 13, color: '#334155', fontWeight: 700 }}>{subInfo?.label}</span>
+                          <div style={{ width: 80, height: 8, background: '#e2e8f0', borderRadius: 4, overflow: 'hidden' }}>
+                            <div style={{ height: '100%', width: `${subAvg}%`, background: barColor, borderRadius: 4 }} />
+                          </div>
+                          <span style={{ fontSize: 13, fontWeight: 700, color: barColor, width: 36, textAlign: 'right' }}>{subAvg}%</span>
                         </div>
-                        <span style={{ fontSize: 13, fontWeight: 700, color: barColor, width: 36, textAlign: 'right' }}>{subAvg}%</span>
+                        {/* Strand rows */}
+                        {strandEntries.length > 0 && (
+                          <div style={{ paddingLeft: 34 }}>
+                            {strandEntries.map(([strand, strandScores]) => {
+                              const strandAvg = Math.round(strandScores.reduce((x, y) => x + y, 0) / strandScores.length)
+                              const strandColor = strandAvg >= 80 ? '#10b981' : strandAvg >= 60 ? '#f59e0b' : '#ef4444'
+                              const isWeak = strandAvg < 65
+                              return (
+                                <div key={strand} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
+                                  <span style={{ fontSize: 10, color: '#94a3b8' }}>↳</span>
+                                  <span style={{ flex: 1, fontSize: 11, color: isWeak ? '#92400e' : '#64748b' }}>{strand}</span>
+                                  <span style={{ fontSize: 11, fontWeight: 700, color: strandColor }}>{strandAvg}%</span>
+                                  <span style={{ fontSize: 10, color: '#94a3b8' }}>({strandScores.length})</span>
+                                  {isWeak && <span style={{ fontSize: 10 }}>⚠️</span>}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )}
                       </div>
                     )
                   })}
@@ -312,23 +403,19 @@ export default function ParentScreen({
               )}
 
               {/* Recent quests */}
-              {history.length > 0 && (
+              {coreHistory.length > 0 && (
                 <div>
                   <div style={{ fontWeight: 700, fontSize: 13, color: '#475569', marginBottom: 8 }}>Recent Quests</div>
-                  {history.filter(h => ['math','english','science','history'].includes(h.subject_id)).slice(0, 6).map((h, i) => {
+                  {coreHistory.slice(0, 6).map((h, i) => {
                     const subInfo = SUBJECTS.find(s => s.id === h.subject_id)
                     const scoreColor = h.score >= 80 ? '#10b981' : h.score >= 60 ? '#f59e0b' : '#ef4444'
                     return (
-                      <div key={i} style={{
-                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                        padding: '7px 0', borderBottom: '1px solid #f1f5f9', fontSize: 13,
-                      }}>
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 0', borderBottom: '1px solid #f1f5f9', fontSize: 13 }}>
                         <span>{subInfo?.emoji} {subInfo?.label}</span>
+                        {h.strand && <span style={{ color: '#94a3b8', fontSize: 10, flex: 1, paddingLeft: 8 }}>{h.strand}</span>}
                         <span style={{ color: '#94a3b8', fontSize: 11 }}>Gr {h.difficulty}</span>
-                        <span style={{ fontWeight: 800, color: scoreColor }}>{h.score}%</span>
-                        <span style={{ color: '#94a3b8', fontSize: 11 }}>
-                          {new Date(h.created_at).toLocaleDateString()}
-                        </span>
+                        <span style={{ fontWeight: 800, color: scoreColor, marginLeft: 8 }}>{h.score}%</span>
+                        <span style={{ color: '#94a3b8', fontSize: 11, marginLeft: 8 }}>{new Date(h.created_at).toLocaleDateString()}</span>
                       </div>
                     )
                   })}
