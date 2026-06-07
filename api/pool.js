@@ -59,26 +59,42 @@ export default async function handler(req, res) {
     if (recentErr) console.error('[pool] recent log read failed:', recentErr.message);
     const recentIds = (recent || []).map(r => r.quest_pool_id).filter(Boolean);
 
-    // Step 2: find candidates the profile hasn't seen recently
-    let { data: candidates, error: candErr } = await db
+    // Step 2: find candidates the profile hasn't seen recently (filter in DB, not JS)
+    let baseQuery = db
       .from('quest_pool')
       .select('id, quest_json, lesson_json, times_served')
       .eq('subject_id', subjectId)
       .eq('grade_level', gradeLevel)
       .eq('is_active', true)
       .order('times_served', { ascending: true })
-      .limit(10);
+      .limit(50);
+
+    // Exclude recently-seen quests at the DB level so we're not capped by the fetch limit
+    if (recentIds.length > 0) {
+      baseQuery = baseQuery.not('id', 'in', `(${recentIds.join(',')})`);
+    }
+
+    let { data: candidates, error: candErr } = await baseQuery;
 
     if (candErr) {
       console.error('[pool] candidate read failed:', candErr.message);
       return res.status(500).json({ error: { code: 'db_error', message: candErr.message } });
     }
 
-    let pick = (candidates || []).find(c => !recentIds.includes(c.id));
+    let pick = candidates && candidates.length > 0 ? candidates[0] : null;
 
-    // Step 3: if everything has been served recently, just pick least-served overall
-    if (!pick && candidates && candidates.length > 0) {
-      pick = candidates[0];
+    // Step 3: all quests seen recently — fall back to least-served overall (no exclusion)
+    if (!pick) {
+      console.warn(`[pool] all recent for ${subjectId}/${gradeLevel}, serving least-served overall`);
+      const { data: fallbackCandidates } = await db
+        .from('quest_pool')
+        .select('id, quest_json, lesson_json, times_served')
+        .eq('subject_id', subjectId)
+        .eq('grade_level', gradeLevel)
+        .eq('is_active', true)
+        .order('times_served', { ascending: true })
+        .limit(1);
+      pick = fallbackCandidates?.[0] || null;
     }
 
     // Step 4: pool empty for this combo — fall back to live generation
