@@ -203,8 +203,7 @@ export default function QuestScreen({
   const useTransfer = !!(explanation?.transferQuestion)
   const transferIsMC = useTransfer
     && Array.isArray(explanation?.transferOptions)
-    && explanation.transferOptions.length === 4
-    && !!explanation.transferCorrect
+    && explanation.transferOptions.length >= 2
 
   const followUpText   = useTransfer ? explanation.transferQuestion : currentQ.followUp
   const followUpAnswer = useTransfer ? (explanation.transferCorrect || explanation.transferAnswer) : currentQ.followUpAnswer
