@@ -36,7 +36,7 @@ const GRADE_PLAN = {
   history: [3, 4, 5, 6, 7, 8],
 };
 
-const TARGET_POOL_SIZE = 40;       // bi-weekly target per (subject, grade)
+const TARGET_POOL_SIZE = 60;       // bi-weekly target per (subject, grade)
 const REFRESH_INTERVAL_DAYS = 14;  // bi-weekly cadence
 const MAX_PER_BATCH = 60;          // cap one batch at this many requests to keep things manageable
 

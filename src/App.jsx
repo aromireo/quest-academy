@@ -261,12 +261,7 @@ export default function App() {
     if (isCorrect) {
       const newStreak = streak + 1
       setStreak(newStreak)
-      const doFollowup = isBoss || Math.random() < 0.4
-      if (doFollowup) {
-        setAnswerState('followup')
-      } else {
-        setAnswerState('correct')
-      }
+      setAnswerState('correct')
       if (!isBoss && newStreak > 0 && newStreak % 3 === 0) {
         generateStretchQuestion(activeSubject, activeProfile).then(s => {
           if (s) setStretchOffer(s)

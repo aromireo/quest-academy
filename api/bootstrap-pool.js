@@ -37,7 +37,7 @@ const GRADE_PLAN = {
   history: [3, 4, 5, 6, 7, 8],
 };
 
-const BOOTSTRAP_TARGET = 12; // quests per (subject, grade) at bootstrap
+const BOOTSTRAP_TARGET = 30; // quests per (subject, grade) at bootstrap
 
 export default async function handler(req, res) {
   // Auth
