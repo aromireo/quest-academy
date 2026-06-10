@@ -137,17 +137,20 @@ export default async function handler(req, res) {
       });
     }
 
-    // Step 5: increment counter + log serve (fire and forget for speed)
+    // Step 5: log the serve BEFORE responding.
+    // Vercel kills the serverless process immediately after res.send(), so
+    // fire-and-forget DB writes are silently dropped. This was the root cause
+    // of quest repeats: the seen record never wrote to quest_served_log.
+    const { error: logErr } = await db.from('quest_served_log')
+      .insert({ profile_id: profileId, quest_pool_id: pick.id });
+    if (logErr) console.error('[pool] log insert failed:', logErr.message);
+
+    // times_served is non-critical - safe to fire-and-forget
     db.from('quest_pool')
       .update({ times_served: (pick.times_served || 0) + 1 })
       .eq('id', pick.id)
       .then(() => {})
       .then(null, err => console.error('[pool] increment failed:', err.message));
-
-    db.from('quest_served_log')
-      .insert({ profile_id: profileId, quest_pool_id: pick.id })
-      .then(() => {})
-      .then(null, err => console.error('[pool] log insert failed:', err.message));
 
     return res.status(200).json({
       quest: pick.quest_json,
