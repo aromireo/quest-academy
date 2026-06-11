@@ -55,6 +55,7 @@ export default function App() {
   const [followupInput, setFollowupInput] = useState('')
   const [followupChecked, setFollowupChecked] = useState(false)
   const [streak, setStreak]               = useState(0)
+  const [wrongCount, setWrongCount]        = useState(0) // tracks wrong answers this session for cost cap
   const [stretchOffer, setStretchOffer]   = useState(null)
   const [stretchAnswered, setStretchAnswered] = useState(null)
 
@@ -225,6 +226,7 @@ export default function App() {
     setFollowupInput('')
     setFollowupChecked(false)
     setStreak(0)
+    setWrongCount(0)
     setStretchOffer(null)
     setStretchAnswered(null)
 
@@ -269,10 +271,12 @@ export default function App() {
       }
     } else {
       setStreak(0)
+      const newWrongCount = wrongCount + 1
+      setWrongCount(newWrongCount)
       setAnswerState('wrong')
       setExplanationLoading(true)
       const exp = await generateExplanation(
-        currentQ.question, option, currentQ.correctAnswer, activeProfile, activeSubject
+        currentQ.question, option, currentQ.correctAnswer, activeProfile, activeSubject, newWrongCount
       )
       setExplanation(exp)
       setExplanationLoading(false)

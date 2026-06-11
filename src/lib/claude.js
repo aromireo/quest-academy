@@ -146,10 +146,15 @@ async function callClaudeRaw({ model, system, user, maxTokens, timeoutMs = 30_00
   }
 }
 
-async function callClaude({ system, user, maxTokens = 800 }) {
+// After this many wrong answers in a session, switch from Sonnet to Haiku.
+const SONNET_WRONG_ANSWER_CAP = 3;
+
+async function callClaude({ system, user, maxTokens = 800, wrongCount = 0 }) {
+  const useHaiku = wrongCount >= SONNET_WRONG_ANSWER_CAP;
+  const primaryModel = useHaiku ? MODEL_FALLBACK : MODEL_PRIMARY;
   try {
     const data = await callClaudeRaw({
-      model: MODEL_PRIMARY,
+      model: primaryModel,
       system, user, maxTokens,
       timeoutMs: 25_000,
     });
@@ -161,6 +166,7 @@ async function callClaude({ system, user, maxTokens = 800 }) {
       primaryErr.status === 429 ||
       primaryErr.status === 529;
     if (!shouldFallback) throw primaryErr;
+    if (useHaiku) throw primaryErr; // already on Haiku, nothing cheaper
     const data = await callClaudeRaw({
       model: MODEL_FALLBACK,
       system, user, maxTokens,
@@ -182,7 +188,7 @@ function extractJson(data) {
 }
 
 // ── Explanation + MC transfer (when kid gets one wrong) ───────────────────────
-export async function generateExplanation(question, wrongAnswer, correctAnswer, profile, subject) {
+export async function generateExplanation(question, wrongAnswer, correctAnswer, profile, subject, wrongCount = 0) {
   const workingLevel = profile?.difficulty_levels?.[subject?.id] || profile?.base_grade_num || 6;
   const name = profile?.name || 'the student';
   const pronouns = profile?.pronouns || 'they/them';
@@ -228,7 +234,7 @@ DISTRACTOR RULES for transferOptions:
 Output ONLY the JSON object.`;
 
   try {
-    const result = await callClaude({ system, user: prompt, maxTokens: 800 });
+    const result = await callClaude({ system, user: prompt, maxTokens: 600, wrongCount });
     let transferOptions = Array.isArray(result.transferOptions) ? result.transferOptions : null;
     let transferCorrect = result.transferCorrect || null;
     if (transferOptions && transferOptions.length === 4) {
