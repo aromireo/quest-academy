@@ -23,6 +23,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
+import { conceptFor } from './_lib/concepts.js';
 
 export const config = { maxDuration: 55 };
 
@@ -308,13 +309,14 @@ async function buildBatchRequests(db) {
         .eq('is_active', true);
       const need = Math.max(0, BOOTSTRAP_TARGET - (count || 0));
       for (let i = 0; i < need; i++) {
+        const concept = conceptFor(subject, grade, (count || 0) + i);
         out.push({
           custom_id: `${subject}_g${grade}_n${i}_${Date.now().toString(36)}${Math.random().toString(36).slice(2,5)}`,
           params: {
             model: 'claude-haiku-4-5-20251001', // pool gen: Haiku is 10x cheaper, quality fine for MC questions
             max_tokens: 2400,
             system: 'You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }. The JSON must include modules (array of 5), miniBoss, bigBoss, AND lesson — all four sections are mandatory.',
-            messages: [{ role: 'user', content: questPrompt(subject, grade) }],
+            messages: [{ role: 'user', content: questPrompt(subject, grade, concept) }],
           },
         });
       }
@@ -323,12 +325,17 @@ async function buildBatchRequests(db) {
   return out;
 }
 
-function questPrompt(subjectId, gradeLevel) {
+function questPrompt(subjectId, gradeLevel, assignedConcept) {
   const labels = { math: 'Math', english: 'English / Language Arts', science: 'Science', history: 'History' };
   const subject = labels[subjectId] || subjectId;
+  const conceptLine = assignedConcept
+    ? `THE CONCEPT FOR THIS QUEST IS: "${assignedConcept}". All 7 questions must test this exact concept. Do not choose a different topic.`
+    : `All 7 questions test ONE focused concept appropriate for Grade ${gradeLevel} ${subject}.`;
   return `Generate a ${subject} quest at Grade ${gradeLevel} curriculum level.
 
 IMPORTANT: Match content to Grade ${gradeLevel} curriculum standards exactly. Make questions challenging but fair.
+
+${conceptLine}
 
 If any word problem features a student, refer to them as "the student" or use {NAME}. Use the placeholder {PRONOUN_SUBJECT} (they/he/she) and {PRONOUN_POSSESSIVE} (their/his/her) where pronouns are needed.
 
@@ -338,7 +345,7 @@ STRUCTURE — all four sections are MANDATORY:
 - "bigBoss": exactly 1 question, transfer to new context
 - "lesson": pre-quest teaching card
 
-All 7 questions test ONE focused concept appropriate for Grade ${gradeLevel} ${subject}.
+All 7 questions test the assigned concept.
 
 Output this EXACT JSON shape (do not omit any top-level key):
 {

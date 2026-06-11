@@ -21,6 +21,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
+import { conceptFor } from './_lib/concepts.js';
 
 export const config = { maxDuration: 55 };
 
@@ -176,6 +177,7 @@ async function buildBatchRequests(db) {
         .eq('is_active', true);
       const need = Math.max(0, TARGET_POOL_SIZE - (count || 0));
       for (let i = 0; i < need; i++) {
+        const concept = conceptFor(subject, grade, (count || 0) + i);
         out.push({
           custom_id: `${subject}_g${grade}_n${i}_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
           params: {
@@ -184,7 +186,7 @@ async function buildBatchRequests(db) {
             system: 'You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }.',
             messages: [{
               role: 'user',
-              content: questPrompt(subject, grade),
+              content: questPrompt(subject, grade, concept),
             }],
           },
           meta: { subject, grade }, // not sent to API, just used in our records
@@ -195,18 +197,21 @@ async function buildBatchRequests(db) {
   return out;
 }
 
-function questPrompt(subjectId, gradeLevel) {
+function questPrompt(subjectId, gradeLevel, assignedConcept) {
   const labels = { math: 'Math', english: 'English / Language Arts', science: 'Science', history: 'History' };
   const subject = labels[subjectId] || subjectId;
+  const conceptLine = assignedConcept
+    ? `THE CONCEPT FOR THIS QUEST IS: "${assignedConcept}". All 7 questions must test this exact concept. Do not choose a different topic.`
+    : `Pick ONE focused concept appropriate for Grade ${gradeLevel} ${subject}. ALL 7 questions must test that single concept.`;
   return `Generate a ${subject} quest at Grade ${gradeLevel} curriculum level.
 
 IMPORTANT: Match content to Grade ${gradeLevel} curriculum standards exactly. The student is genuinely working at this level — make questions challenging but fair.
 
+${conceptLine}
+
 If any word problem features a student, refer to them as "the student" or use the placeholder {NAME}. Do not assume a name or gender. Use the placeholder {PRONOUN_SUBJECT} (they/he/she) and {PRONOUN_POSSESSIVE} (their/his/her) where pronouns are needed.
 
 STRUCTURE:
-- Pick ONE focused concept appropriate for Grade ${gradeLevel} ${subject}.
-- ALL 7 questions in this quest must test that single concept.
 - 5 "module" questions (progressive practice).
 - 1 "miniBoss" (synthesis).
 - 1 "bigBoss" (transfer to new context).
