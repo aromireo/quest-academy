@@ -1,36 +1,40 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// /api/cron-refill-pool.js  —  v12  (ROTATION + SYNCHRONOUS)
+// /api/cron-refill-pool.js  —  v12  (BOUNDED DAILY LOOP)
 //
-// WHAT CHANGED FROM v11 (and why the kids were seeing repeats):
+// PROBLEM HISTORY:
 //   v11 "topped up" each (subject, grade) pool TO a fixed target and never
-//   retired anything. Once a pool reached the target, `need = 0` forever, so
-//   NO new quests were ever generated again. The pool froze and kids cycled
-//   through the same fixed set. On top of that, v11 relied on the Batches API
-//   with day-to-day polling, which needs the Vercel cron to fire every single
-//   day — unreliable on the Hobby plan, so cycles stalled.
+//   retired anything, so once full it generated nothing more forever — the pool
+//   froze and kids saw repeats. It also used the Batches API with day-to-day
+//   polling, which needs the Hobby cron to fire every day (unreliable), and a
+//   single big batch/synchronous fill blew past Vercel's 60-second limit (504).
 //
-//   v12 fixes both:
-//     1. ROTATION: every cycle we RETIRE the oldest ROTATION_SIZE quests per
-//        (subject, grade) (set is_active = false), then GENERATE that many
-//        fresh ones. A third of every pool is new each cycle. Kids can't
-//        out-run it.
-//     2. SYNCHRONOUS + SELF-HEALING: generation happens with direct Haiku
-//        calls (in small parallel groups) within ONE invocation. No multi-day
-//        batch polling. A single daily cron fire does the whole job, and if
-//        Hobby skips a day, the next fire fully catches up on its own.
+// v12 DESIGN — small bounded work per invocation, run daily, self-healing:
+//   Each daily cron run does AT MOST `MAX_GEN_PER_RUN` generations and returns
+//   well under the timeout. Two phases, in priority order:
 //
-// COST: direct Haiku calls are ~2x the Batches API price but still tiny.
-//   ~15 quests × 26 (subject,grade) combos every 14 days on Haiku
-//   ≈ $0.15–0.30 per cycle → well under $1/month. Inside the $30 cap.
+//     PHASE 1 — SELF-HEAL: if any (subject, grade) is below TARGET_POOL_SIZE,
+//       generate toward the most-starved combos first. This is how the pool
+//       fills from a cold/starved start — no bootstrap, no manual clicking.
+//       It just fills a little each day until every combo reaches target.
 //
-// Secured by CRON_SECRET (Vercel sends Authorization: Bearer <CRON_SECRET>).
-// Also accepts ?secret= for manual triggering from a browser.
-// Optional: &force=1 to bypass the 14-day gate (manual refresh).
+//     PHASE 2 — ROTATE: once nothing is starved, retire the oldest few quests
+//       from a small ROLLING SLICE of combos (a couple per day) and regenerate
+//       them. Over ~2 weeks the whole fleet rotates. Bi-weekly cadence, spread
+//       across daily runs so each run stays tiny.
+//
+//   Because each run is bounded, it CANNOT time out, and if Hobby skips a day
+//   the next run simply picks up where it left off. Fully self-healing.
+//
+// COST: direct Haiku calls, ~20 quests/day max → pennies/day, well under $1/mo.
+//
+// Auth: CRON_SECRET (Vercel sends Authorization: Bearer <CRON_SECRET>).
+//   Manual nudge from a browser: ?secret=YOUR_CRON_SECRET&run=1
+//   (&run=1 does exactly ONE bounded chunk — it also cannot time out.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
-import { conceptFor, conceptCount } from './_lib/concepts.js';
+import { conceptFor } from './_lib/concepts.js';
 
 export const config = { maxDuration: 55 };
 
@@ -45,12 +49,13 @@ const GRADE_PLAN = {
   history: [3, 4, 5, 6, 7, 8],
 };
 
-// ─── Rotation config ─────────────────────────────────────────────────────────
+// ─── Config ──────────────────────────────────────────────────────────────────
 const TARGET_POOL_SIZE = 45;       // active quests to keep per (subject, grade)
-const ROTATION_SIZE = 15;          // retire & replace this many oldest per cycle
-const REFRESH_INTERVAL_DAYS = 14;  // bi-weekly cadence
-const GEN_CONCURRENCY = 4;         // how many Haiku calls to run in parallel
-const MAX_GEN_PER_RUN = 130;       // safety cap on total generations per invocation
+const ROTATION_PER_COMBO = 15;     // when rotating, retire+replace this many oldest
+const COMBOS_PER_DAY = 2;          // how many combos to rotate per daily run
+const REFRESH_INTERVAL_DAYS = 14;  // full-fleet rotation cadence (spread across days)
+const MAX_GEN_PER_RUN = 30;        // hard cap per invocation — ~40s at 5-wide, safe under 55s
+const GEN_CONCURRENCY = 5;         // parallel Haiku calls per group
 
 export default async function handler(req, res) {
   // Auth
@@ -59,9 +64,7 @@ export default async function handler(req, res) {
   const isVercelCron = process.env.CRON_SECRET && authHeader === expectedBearer;
   const manualSecret = req.query?.secret;
   const authed = isVercelCron || (manualSecret && manualSecret === process.env.CRON_SECRET);
-  if (!authed) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!authed) return res.status(401).json({ error: 'Unauthorized' });
 
   const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -75,127 +78,138 @@ export default async function handler(req, res) {
     realtime: { transport: ws },
   });
 
-  const force = req.query?.force === '1';
-
-  // Load state
   let state = await loadState(db);
 
-  // Gate: only run if it's been >= REFRESH_INTERVAL_DAYS (unless forced)
-  const lastRefresh = state.last_refresh_at ? new Date(state.last_refresh_at) : null;
-  const daysSinceRefresh = lastRefresh
-    ? (Date.now() - lastRefresh.getTime()) / (24 * 60 * 60 * 1000)
-    : Infinity;
+  // Snapshot active counts for every combo (one lightweight query per combo).
+  const counts = await getCounts(db);
 
-  if (!force && daysSinceRefresh < REFRESH_INTERVAL_DAYS) {
+  // ─── PHASE 1: self-heal starved combos ─────────────────────────────────────
+  // Sort combos by how far below target they are (most starved first).
+  const starved = [];
+  for (const { subject, grade } of allCombos()) {
+    const active = counts[key(subject, grade)] || 0;
+    const deficit = TARGET_POOL_SIZE - active;
+    if (deficit > 0) starved.push({ subject, grade, active, deficit });
+  }
+  starved.sort((a, b) => b.deficit - a.deficit);
+
+  if (starved.length > 0) {
+    const jobs = [];
+    for (const s of starved) {
+      for (let i = 0; i < s.deficit && jobs.length < MAX_GEN_PER_RUN; i++) {
+        jobs.push({ subject: s.subject, grade: s.grade, conceptIndex: s.active + i });
+      }
+      if (jobs.length >= MAX_GEN_PER_RUN) break;
+    }
+
+    const { inserted, failed } = await runJobs(db, ANTHROPIC_KEY, jobs);
+
+    // Recompute remaining deficit for the report (cheap: derive from counts).
+    const totalDeficit = starved.reduce((sum, s) => sum + s.deficit, 0);
+
+    state.pending_batch_id = null;      // clear any stale v11 batch cruft
+    state.pending_batch_submitted_at = null;
+    state.pending_batch_request_count = null;
+    state.last_batch_inserted = null;
+    state.phase = 'self_heal';
+    state.last_run_at = new Date().toISOString();
+    state.last_inserted = inserted;
+    state.last_failed = failed;
+    state.notes = `v12 self-heal: +${inserted} (failed ${failed}); ~${Math.max(0, totalDeficit - inserted)} still needed across pools`;
+    await saveState(db, state);
+    await trimServedLog(db);
+
     return res.status(200).json({
-      action: 'no_op',
-      reason: 'not_yet_time_to_refresh',
-      daysSinceRefresh: daysSinceRefresh.toFixed(1),
-      nextRefreshIn: (REFRESH_INTERVAL_DAYS - daysSinceRefresh).toFixed(1),
+      action: 'self_heal',
+      inserted,
+      failed,
+      combos_still_starved: Math.max(0, starved.length - starved.filter(s => s.deficit <= inserted).length),
+      approx_remaining: Math.max(0, totalDeficit - inserted),
+      note: 'Runs again daily until all pools reach target. No action needed.',
     });
   }
 
-  // Build the work plan: for each combo, how many to retire and how many to make
-  const plan = await buildPlan(db);
+  // ─── PHASE 2: rolling rotation (only once nothing is starved) ───────────────
+  // Gate rotation so the full fleet turns over roughly every REFRESH_INTERVAL_DAYS.
+  // We advance a rolling cursor by COMBOS_PER_DAY each run; pacing works out to
+  // (26 combos / COMBOS_PER_DAY) days per full sweep ≈ 13 days at 2/day.
+  const combos = allCombos();
+  let cursor = Number.isInteger(state.rotation_cursor) ? state.rotation_cursor : 0;
 
-  // ─── Step 1: retire oldest quests per combo ────────────────────────────────
+  // Only rotate if it's been at least ~ (REFRESH_INTERVAL_DAYS / sweepDays) since
+  // last rotation step — but simplest robust approach: rotate a slice every run,
+  // which naturally paces the fleet. We still record last_rotation_at for clarity.
+  const slice = [];
+  for (let i = 0; i < COMBOS_PER_DAY; i++) {
+    slice.push(combos[(cursor + i) % combos.length]);
+  }
+  cursor = (cursor + COMBOS_PER_DAY) % combos.length;
+
   let retiredTotal = 0;
-  for (const item of plan) {
-    if (item.retire > 0) {
+  const jobs = [];
+  for (const { subject, grade } of slice) {
+    const active = counts[key(subject, grade)] || 0;
+    const retire = Math.min(ROTATION_PER_COMBO, active);
+    if (retire > 0) {
       const { data: oldest } = await db
         .from('quest_pool')
         .select('id')
-        .eq('subject_id', item.subject)
-        .eq('grade_level', item.grade)
+        .eq('subject_id', subject)
+        .eq('grade_level', grade)
         .eq('is_active', true)
         .order('created_at', { ascending: true })
-        .limit(item.retire);
+        .limit(retire);
       const ids = (oldest || []).map(r => r.id);
       if (ids.length > 0) {
-        const { error } = await db
-          .from('quest_pool')
-          .update({ is_active: false })
-          .in('id', ids);
+        const { error } = await db.from('quest_pool').update({ is_active: false }).in('id', ids);
         if (!error) retiredTotal += ids.length;
       }
     }
-  }
-
-  // ─── Step 2: generate replacements synchronously (Haiku, small parallel) ────
-  // Flatten the plan into individual generation jobs.
-  const jobs = [];
-  for (const item of plan) {
-    for (let i = 0; i < item.generate; i++) {
-      // Offset the concept index by created count so we cycle through the bank
-      // rather than repeating the same canonical concept every time.
-      const idx = (item.baseCount + i);
-      jobs.push({ subject: item.subject, grade: item.grade, conceptIndex: idx });
-    }
-  }
-  const capped = jobs.slice(0, MAX_GEN_PER_RUN);
-
-  let inserted = 0, failed = 0;
-  for (let i = 0; i < capped.length; i += GEN_CONCURRENCY) {
-    const group = capped.slice(i, i + GEN_CONCURRENCY);
-    const results = await Promise.all(
-      group.map(job => generateOne(db, ANTHROPIC_KEY, job))
-    );
-    for (const ok of results) {
-      if (ok) inserted++; else failed++;
+    // Regenerate to restore target after retiring.
+    const afterRetire = Math.max(0, active - retire);
+    const need = Math.max(0, TARGET_POOL_SIZE - afterRetire);
+    for (let i = 0; i < need && jobs.length < MAX_GEN_PER_RUN; i++) {
+      jobs.push({ subject, grade, conceptIndex: afterRetire + i });
     }
   }
 
-  // ─── Step 3: record success + housekeeping ─────────────────────────────────
-  state.pending_batch_id = null; // v12 no longer uses batches; clear any stale id
-  state.last_refresh_at = new Date().toISOString();
+  const { inserted, failed } = await runJobs(db, ANTHROPIC_KEY, jobs);
+
+  state.pending_batch_id = null;
+  state.rotation_cursor = cursor;
+  state.phase = 'rotate';
+  state.last_run_at = new Date().toISOString();
+  state.last_rotation_at = new Date().toISOString();
   state.last_retired = retiredTotal;
   state.last_inserted = inserted;
   state.last_failed = failed;
-  state.notes = `v12 rotation: retired ${retiredTotal}, inserted ${inserted}, failed ${failed}`;
+  state.notes = `v12 rotate: slice ${JSON.stringify(slice.map(s => `${s.subject}${s.grade}`))}, retired ${retiredTotal}, +${inserted} (failed ${failed})`;
   await saveState(db, state);
   await trimServedLog(db);
 
   return res.status(200).json({
-    action: 'rotation_complete',
+    action: 'rotate',
+    slice: slice.map(s => `${s.subject}_g${s.grade}`),
     retired: retiredTotal,
     inserted,
     failed,
-    combos: plan.length,
-    forced: force,
+    next_cursor: cursor,
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Plan builder: decide retire/generate counts per combo.
-//
-//   - retire   = min(ROTATION_SIZE, currentActive)  → drop the oldest
-//   - generate = enough to bring the pool back to TARGET_POOL_SIZE AFTER retiring
-//                (this also self-heals combos that were left below target by v11,
-//                 e.g. english/science/history stuck at 30, math g6 at 1)
+// Run a set of generation jobs in bounded parallel groups.
 // ─────────────────────────────────────────────────────────────────────────────
-async function buildPlan(db) {
-  const plan = [];
-  for (const subject of SUBJECTS) {
-    for (const grade of (GRADE_PLAN[subject] || [])) {
-      const { count } = await db
-        .from('quest_pool')
-        .select('id', { count: 'exact', head: true })
-        .eq('subject_id', subject)
-        .eq('grade_level', grade)
-        .eq('is_active', true);
-      const active = count || 0;
-      const retire = Math.min(ROTATION_SIZE, active);
-      const afterRetire = active - retire;
-      const generate = Math.max(0, TARGET_POOL_SIZE - afterRetire);
-      plan.push({ subject, grade, active, retire, generate, baseCount: active });
-    }
+async function runJobs(db, apiKey, jobs) {
+  let inserted = 0, failed = 0;
+  for (let i = 0; i < jobs.length; i += GEN_CONCURRENCY) {
+    const group = jobs.slice(i, i + GEN_CONCURRENCY);
+    const results = await Promise.all(group.map(j => generateOne(db, apiKey, j)));
+    for (const ok of results) { if (ok) inserted++; else failed++; }
   }
-  return plan;
+  return { inserted, failed };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Generate ONE quest synchronously and insert it. Returns true on success.
-// ─────────────────────────────────────────────────────────────────────────────
 async function generateOne(db, apiKey, job) {
   const { subject, grade, conceptIndex } = job;
   const concept = conceptFor(subject, grade, conceptIndex);
@@ -208,7 +222,7 @@ async function generateOne(db, apiKey, job) {
         'anthropic-version': ANTHROPIC_VERSION,
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001', // pool gen: Haiku, 10x cheaper
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 2400,
         system: 'You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }.',
         messages: [{ role: 'user', content: questPrompt(subject, grade, concept) }],
@@ -225,7 +239,6 @@ async function generateOne(db, apiKey, job) {
     if (!parsed.modules || parsed.modules.length < 5 || !parsed.miniBoss || !parsed.bigBoss || !parsed.lesson) {
       return false;
     }
-    // Normalize correctAnswers
     const allQs = [...parsed.modules, parsed.miniBoss, parsed.bigBoss];
     for (const q of allQs) {
       if (!Array.isArray(q.options)) return false;
@@ -258,15 +271,39 @@ async function generateOne(db, apiKey, job) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// State management
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+function allCombos() {
+  const out = [];
+  for (const subject of SUBJECTS) {
+    for (const grade of (GRADE_PLAN[subject] || [])) out.push({ subject, grade });
+  }
+  return out;
+}
+
+function key(subject, grade) { return `${subject}_${grade}`; }
+
+async function getCounts(db) {
+  const counts = {};
+  for (const { subject, grade } of allCombos()) {
+    const { count } = await db
+      .from('quest_pool')
+      .select('id', { count: 'exact', head: true })
+      .eq('subject_id', subject)
+      .eq('grade_level', grade)
+      .eq('is_active', true);
+    counts[key(subject, grade)] = count || 0;
+  }
+  return counts;
+}
+
 async function loadState(db) {
   const { data } = await db
     .from('cron_state')
     .select('value')
     .eq('key', 'pool_refresh')
     .maybeSingle();
-  return data?.value || { pending_batch_id: null, last_refresh_at: null };
+  return data?.value || { rotation_cursor: 0, last_run_at: null };
 }
 
 async function saveState(db, value) {
@@ -278,9 +315,6 @@ async function trimServedLog(db) {
   await db.from('quest_served_log').delete().lt('served_at', cutoff);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Prompt (unchanged from v11)
-// ─────────────────────────────────────────────────────────────────────────────
 function questPrompt(subjectId, gradeLevel, assignedConcept) {
   const labels = { math: 'Math', english: 'English / Language Arts', science: 'Science', history: 'History' };
   const subject = labels[subjectId] || subjectId;
