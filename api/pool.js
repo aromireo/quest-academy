@@ -21,8 +21,10 @@ export const config = { maxDuration: 55 };
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Recent-served window: don't show a kid the same quest twice within this many days
-const RECENT_WINDOW_DAYS = 14;
+// Recent-served window: don't show a kid the same quest twice within this many days.
+// Widened in v12 (was 14) so a kid has to work through more of the pool before
+// any repeat is even considered.
+const RECENT_WINDOW_DAYS = 30;
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -82,19 +84,54 @@ export default async function handler(req, res) {
     }
 
     let pick = candidates && candidates.length > 0 ? candidates[0] : null;
+    let servedSource = 'pool';
 
-    // Step 3: all quests seen recently — fall back to least-served overall (no exclusion)
+    // Step 3: every active quest has been seen within the recent window.
+    // This means the kid has genuinely exhausted the fresh pool for this combo.
+    // v11 bug: it fell back to `times_served ASC` (least-served overall), which
+    // could re-serve a quest the kid saw *yesterday* just because it had a low
+    // serve count — an obvious repeat with no signal that anything was wrong.
+    // v12: serve the quest this profile saw LONGEST ago (least-recently-seen),
+    // so any unavoidable repeat is the one the kid is most likely to have
+    // forgotten, and we tag the response so repeats are visible, not silent.
     if (!pick) {
-      console.warn(`[pool] all recent for ${subjectId}/${gradeLevel}, serving least-served overall`);
-      const { data: fallbackCandidates } = await db
-        .from('quest_pool')
-        .select('id, quest_json, lesson_json, times_served')
-        .eq('subject_id', subjectId)
-        .eq('grade_level', gradeLevel)
-        .eq('is_active', true)
-        .order('times_served', { ascending: true })
-        .limit(1);
-      pick = fallbackCandidates?.[0] || null;
+      console.warn(`[pool] EXHAUSTED: ${subjectId}/${gradeLevel} for profile ${profileId} — all active quests seen in last ${RECENT_WINDOW_DAYS}d. Serving least-recently-seen. Pool likely needs rotation.`);
+      servedSource = 'repeat_exhausted';
+
+      // Find this profile's oldest serve for this combo.
+      const { data: oldestSeen } = await db
+        .from('quest_served_log')
+        .select('quest_pool_id, served_at')
+        .eq('profile_id', profileId)
+        .order('served_at', { ascending: true })
+        .limit(200);
+
+      const seenOrder = (oldestSeen || []).map(r => r.quest_pool_id).filter(Boolean);
+      // Walk from oldest-seen forward, pick the first that's still active in this combo.
+      for (const seenId of seenOrder) {
+        const { data: row } = await db
+          .from('quest_pool')
+          .select('id, quest_json, lesson_json, times_served')
+          .eq('id', seenId)
+          .eq('subject_id', subjectId)
+          .eq('grade_level', gradeLevel)
+          .eq('is_active', true)
+          .maybeSingle();
+        if (row) { pick = row; break; }
+      }
+
+      // Absolute last resort: least-served active quest for this combo.
+      if (!pick) {
+        const { data: fallbackCandidates } = await db
+          .from('quest_pool')
+          .select('id, quest_json, lesson_json, times_served')
+          .eq('subject_id', subjectId)
+          .eq('grade_level', gradeLevel)
+          .eq('is_active', true)
+          .order('times_served', { ascending: true })
+          .limit(1);
+        pick = fallbackCandidates?.[0] || null;
+      }
     }
 
     // Step 4: pool empty for this combo — fall back to live generation
@@ -156,7 +193,7 @@ export default async function handler(req, res) {
       quest: pick.quest_json,
       lesson: pick.lesson_json,
       poolId: pick.id,
-      source: 'pool',
+      source: servedSource, // 'pool' normally, 'repeat_exhausted' when pool ran dry
     });
   } catch (err) {
     console.error('[pool] unexpected error:', err);

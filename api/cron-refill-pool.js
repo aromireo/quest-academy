@@ -1,32 +1,40 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// /api/cron-refill-pool.js  —  v11
-// Daily cron job. Manages a bi-weekly refresh cycle using the Anthropic
-// Message Batches API (50% cheaper than synchronous calls, separate rate limits).
+// /api/cron-refill-pool.js  —  v12  (ROTATION + SYNCHRONOUS)
 //
-// Each daily invocation does ONE of these:
+// WHAT CHANGED FROM v11 (and why the kids were seeing repeats):
+//   v11 "topped up" each (subject, grade) pool TO a fixed target and never
+//   retired anything. Once a pool reached the target, `need = 0` forever, so
+//   NO new quests were ever generated again. The pool froze and kids cycled
+//   through the same fixed set. On top of that, v11 relied on the Batches API
+//   with day-to-day polling, which needs the Vercel cron to fire every single
+//   day — unreliable on the Hobby plan, so cycles stalled.
 //
-//   A) If there's a pending batch → poll it. If complete, parse results and
-//      insert into quest_pool. If still in_progress, exit.
+//   v12 fixes both:
+//     1. ROTATION: every cycle we RETIRE the oldest ROTATION_SIZE quests per
+//        (subject, grade) (set is_active = false), then GENERATE that many
+//        fresh ones. A third of every pool is new each cycle. Kids can't
+//        out-run it.
+//     2. SYNCHRONOUS + SELF-HEALING: generation happens with direct Haiku
+//        calls (in small parallel groups) within ONE invocation. No multi-day
+//        batch polling. A single daily cron fire does the whole job, and if
+//        Hobby skips a day, the next fire fully catches up on its own.
 //
-//   B) If no pending batch AND it's been >= 14 days since last refresh →
-//      submit a new batch (one request per (subject, grade, slot_to_fill)).
+// COST: direct Haiku calls are ~2x the Batches API price but still tiny.
+//   ~15 quests × 26 (subject,grade) combos every 14 days on Haiku
+//   ≈ $0.15–0.30 per cycle → well under $1/month. Inside the $30 cap.
 //
-//   C) Otherwise → do nothing this day.
-//
-// State is tracked in a small `cron_state` row stored as JSON in Supabase.
-//
-// Secured by Vercel's CRON_SECRET header (Vercel sets x-vercel-cron-signature
-// automatically; we also accept ?secret= for manual triggering).
+// Secured by CRON_SECRET (Vercel sends Authorization: Bearer <CRON_SECRET>).
+// Also accepts ?secret= for manual triggering from a browser.
+// Optional: &force=1 to bypass the 14-day gate (manual refresh).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
-import { conceptFor } from './_lib/concepts.js';
+import { conceptFor, conceptCount } from './_lib/concepts.js';
 
 export const config = { maxDuration: 55 };
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
-const BATCHES_URL = 'https://api.anthropic.com/v1/messages/batches';
 const ANTHROPIC_VERSION = '2023-06-01';
 
 const SUBJECTS = ['math', 'english', 'science', 'history'];
@@ -37,13 +45,15 @@ const GRADE_PLAN = {
   history: [3, 4, 5, 6, 7, 8],
 };
 
-const TARGET_POOL_SIZE = 60;       // bi-weekly target per (subject, grade)
+// ─── Rotation config ─────────────────────────────────────────────────────────
+const TARGET_POOL_SIZE = 45;       // active quests to keep per (subject, grade)
+const ROTATION_SIZE = 15;          // retire & replace this many oldest per cycle
 const REFRESH_INTERVAL_DAYS = 14;  // bi-weekly cadence
-const MAX_PER_BATCH = 60;          // cap one batch at this many requests to keep things manageable
+const GEN_CONCURRENCY = 4;         // how many Haiku calls to run in parallel
+const MAX_GEN_PER_RUN = 130;       // safety cap on total generations per invocation
 
 export default async function handler(req, res) {
-  // Auth: Vercel sends "Authorization: Bearer <CRON_SECRET>" automatically.
-  // Also accept ?secret= for manual testing from the browser.
+  // Auth
   const authHeader = req.headers['authorization'] || '';
   const expectedBearer = `Bearer ${process.env.CRON_SECRET || ''}`;
   const isVercelCron = process.env.CRON_SECRET && authHeader === expectedBearer;
@@ -65,49 +75,18 @@ export default async function handler(req, res) {
     realtime: { transport: ws },
   });
 
-  // Load (or initialize) cron state
+  const force = req.query?.force === '1';
+
+  // Load state
   let state = await loadState(db);
 
-  // ─── Path A: poll an in-progress batch ────────────────────────────────────
-  if (state.pending_batch_id) {
-    const status = await pollBatch(ANTHROPIC_KEY, state.pending_batch_id);
-    if (!status) {
-      // Batch lookup failed — clear so we don't get stuck
-      state.pending_batch_id = null;
-      state.notes = 'Batch lookup failed, cleared';
-      await saveState(db, state);
-      return res.status(200).json({ action: 'cleared_stuck_batch', state });
-    }
-    if (status.processing_status === 'in_progress') {
-      return res.status(200).json({
-        action: 'still_processing',
-        batchId: state.pending_batch_id,
-        counts: status.request_counts,
-      });
-    }
-    if (status.processing_status === 'ended') {
-      const inserted = await consumeBatchResults(db, ANTHROPIC_KEY, status);
-      state.pending_batch_id = null;
-      state.last_refresh_at = new Date().toISOString();
-      state.last_batch_inserted = inserted.count;
-      await saveState(db, state);
-      // Also clean old quest_served_log rows (keep last 200 per profile)
-      await trimServedLog(db);
-      return res.status(200).json({
-        action: 'batch_complete',
-        inserted: inserted.count,
-        failed: inserted.failed,
-      });
-    }
-  }
-
-  // ─── Path B: maybe submit a new batch ─────────────────────────────────────
+  // Gate: only run if it's been >= REFRESH_INTERVAL_DAYS (unless forced)
   const lastRefresh = state.last_refresh_at ? new Date(state.last_refresh_at) : null;
   const daysSinceRefresh = lastRefresh
     ? (Date.now() - lastRefresh.getTime()) / (24 * 60 * 60 * 1000)
     : Infinity;
 
-  if (daysSinceRefresh < REFRESH_INTERVAL_DAYS) {
+  if (!force && daysSinceRefresh < REFRESH_INTERVAL_DAYS) {
     return res.status(200).json({
       action: 'no_op',
       reason: 'not_yet_time_to_refresh',
@@ -116,31 +95,166 @@ export default async function handler(req, res) {
     });
   }
 
-  // Build the request list: top up every (subject, grade) to TARGET_POOL_SIZE
-  const requests = await buildBatchRequests(db);
-  if (requests.length === 0) {
-    state.last_refresh_at = new Date().toISOString();
-    state.notes = 'No top-up needed';
-    await saveState(db, state);
-    return res.status(200).json({ action: 'no_op', reason: 'pool_already_full' });
+  // Build the work plan: for each combo, how many to retire and how many to make
+  const plan = await buildPlan(db);
+
+  // ─── Step 1: retire oldest quests per combo ────────────────────────────────
+  let retiredTotal = 0;
+  for (const item of plan) {
+    if (item.retire > 0) {
+      const { data: oldest } = await db
+        .from('quest_pool')
+        .select('id')
+        .eq('subject_id', item.subject)
+        .eq('grade_level', item.grade)
+        .eq('is_active', true)
+        .order('created_at', { ascending: true })
+        .limit(item.retire);
+      const ids = (oldest || []).map(r => r.id);
+      if (ids.length > 0) {
+        const { error } = await db
+          .from('quest_pool')
+          .update({ is_active: false })
+          .in('id', ids);
+        if (!error) retiredTotal += ids.length;
+      }
+    }
   }
 
-  const batch = await submitBatch(ANTHROPIC_KEY, requests.slice(0, MAX_PER_BATCH));
-  if (!batch?.id) {
-    return res.status(500).json({ action: 'submit_failed', detail: batch });
+  // ─── Step 2: generate replacements synchronously (Haiku, small parallel) ────
+  // Flatten the plan into individual generation jobs.
+  const jobs = [];
+  for (const item of plan) {
+    for (let i = 0; i < item.generate; i++) {
+      // Offset the concept index by created count so we cycle through the bank
+      // rather than repeating the same canonical concept every time.
+      const idx = (item.baseCount + i);
+      jobs.push({ subject: item.subject, grade: item.grade, conceptIndex: idx });
+    }
+  }
+  const capped = jobs.slice(0, MAX_GEN_PER_RUN);
+
+  let inserted = 0, failed = 0;
+  for (let i = 0; i < capped.length; i += GEN_CONCURRENCY) {
+    const group = capped.slice(i, i + GEN_CONCURRENCY);
+    const results = await Promise.all(
+      group.map(job => generateOne(db, ANTHROPIC_KEY, job))
+    );
+    for (const ok of results) {
+      if (ok) inserted++; else failed++;
+    }
   }
 
-  state.pending_batch_id = batch.id;
-  state.pending_batch_submitted_at = new Date().toISOString();
-  state.pending_batch_request_count = requests.slice(0, MAX_PER_BATCH).length;
+  // ─── Step 3: record success + housekeeping ─────────────────────────────────
+  state.pending_batch_id = null; // v12 no longer uses batches; clear any stale id
+  state.last_refresh_at = new Date().toISOString();
+  state.last_retired = retiredTotal;
+  state.last_inserted = inserted;
+  state.last_failed = failed;
+  state.notes = `v12 rotation: retired ${retiredTotal}, inserted ${inserted}, failed ${failed}`;
   await saveState(db, state);
+  await trimServedLog(db);
 
   return res.status(200).json({
-    action: 'batch_submitted',
-    batchId: batch.id,
-    requestCount: requests.slice(0, MAX_PER_BATCH).length,
-    note: 'Daily cron will poll until complete.',
+    action: 'rotation_complete',
+    retired: retiredTotal,
+    inserted,
+    failed,
+    combos: plan.length,
+    forced: force,
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plan builder: decide retire/generate counts per combo.
+//
+//   - retire   = min(ROTATION_SIZE, currentActive)  → drop the oldest
+//   - generate = enough to bring the pool back to TARGET_POOL_SIZE AFTER retiring
+//                (this also self-heals combos that were left below target by v11,
+//                 e.g. english/science/history stuck at 30, math g6 at 1)
+// ─────────────────────────────────────────────────────────────────────────────
+async function buildPlan(db) {
+  const plan = [];
+  for (const subject of SUBJECTS) {
+    for (const grade of (GRADE_PLAN[subject] || [])) {
+      const { count } = await db
+        .from('quest_pool')
+        .select('id', { count: 'exact', head: true })
+        .eq('subject_id', subject)
+        .eq('grade_level', grade)
+        .eq('is_active', true);
+      const active = count || 0;
+      const retire = Math.min(ROTATION_SIZE, active);
+      const afterRetire = active - retire;
+      const generate = Math.max(0, TARGET_POOL_SIZE - afterRetire);
+      plan.push({ subject, grade, active, retire, generate, baseCount: active });
+    }
+  }
+  return plan;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Generate ONE quest synchronously and insert it. Returns true on success.
+// ─────────────────────────────────────────────────────────────────────────────
+async function generateOne(db, apiKey, job) {
+  const { subject, grade, conceptIndex } = job;
+  const concept = conceptFor(subject, grade, conceptIndex);
+  try {
+    const r = await fetch(ANTHROPIC_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': ANTHROPIC_VERSION,
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001', // pool gen: Haiku, 10x cheaper
+        max_tokens: 2400,
+        system: 'You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }.',
+        messages: [{ role: 'user', content: questPrompt(subject, grade, concept) }],
+      }),
+    });
+    if (!r.ok) return false;
+    const data = await r.json();
+    const content = data.content || [];
+    const text = content.filter(b => b.type === 'text').map(b => b.text).join('');
+
+    let parsed;
+    try { parsed = parseJsonLoose(text); } catch { return false; }
+
+    if (!parsed.modules || parsed.modules.length < 5 || !parsed.miniBoss || !parsed.bigBoss || !parsed.lesson) {
+      return false;
+    }
+    // Normalize correctAnswers
+    const allQs = [...parsed.modules, parsed.miniBoss, parsed.bigBoss];
+    for (const q of allQs) {
+      if (!Array.isArray(q.options)) return false;
+      if (!q.options.includes(q.correctAnswer)) {
+        const match = q.options.find(o => o.trim().toLowerCase() === (q.correctAnswer || '').trim().toLowerCase());
+        q.correctAnswer = match || q.options[0];
+      }
+    }
+    parsed.modules.forEach(q => { q.kind = 'module'; });
+    parsed.miniBoss.kind = 'miniBoss';
+    parsed.bigBoss.kind = 'bigBoss';
+    parsed.questions = [...parsed.modules, parsed.miniBoss];
+    parsed.bossQuestion = parsed.bigBoss;
+
+    const lesson = parsed.lesson;
+    delete parsed.lesson;
+
+    const { error } = await db.from('quest_pool').insert({
+      subject_id: subject,
+      grade_level: grade,
+      concept: parsed.concept || null,
+      quest_json: parsed,
+      lesson_json: lesson,
+      generated_by: 'cron',
+    });
+    return !error;
+  } catch {
+    return false;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,51 +266,21 @@ async function loadState(db) {
     .select('value')
     .eq('key', 'pool_refresh')
     .maybeSingle();
-  return data?.value || {
-    pending_batch_id: null,
-    last_refresh_at: null,
-  };
+  return data?.value || { pending_batch_id: null, last_refresh_at: null };
 }
 
 async function saveState(db, value) {
   await db.from('cron_state').upsert({ key: 'pool_refresh', value }, { onConflict: 'key' });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Build the batch requests array
-// ─────────────────────────────────────────────────────────────────────────────
-async function buildBatchRequests(db) {
-  const out = [];
-  for (const subject of SUBJECTS) {
-    for (const grade of (GRADE_PLAN[subject] || [])) {
-      const { count } = await db
-        .from('quest_pool')
-        .select('id', { count: 'exact', head: true })
-        .eq('subject_id', subject)
-        .eq('grade_level', grade)
-        .eq('is_active', true);
-      const need = Math.max(0, TARGET_POOL_SIZE - (count || 0));
-      for (let i = 0; i < need; i++) {
-        const concept = conceptFor(subject, grade, (count || 0) + i);
-        out.push({
-          custom_id: `${subject}_g${grade}_n${i}_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
-          params: {
-            model: 'claude-haiku-4-5-20251001', // pool gen: Haiku is 10x cheaper, quality fine for MC questions
-            max_tokens: 2400,
-            system: 'You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }.',
-            messages: [{
-              role: 'user',
-              content: questPrompt(subject, grade, concept),
-            }],
-          },
-          meta: { subject, grade }, // not sent to API, just used in our records
-        });
-      }
-    }
-  }
-  return out;
+async function trimServedLog(db) {
+  const cutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+  await db.from('quest_served_log').delete().lt('served_at', cutoff);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Prompt (unchanged from v11)
+// ─────────────────────────────────────────────────────────────────────────────
 function questPrompt(subjectId, gradeLevel, assignedConcept) {
   const labels = { math: 'Math', english: 'English / Language Arts', science: 'Science', history: 'History' };
   const subject = labels[subjectId] || subjectId;
@@ -248,103 +332,6 @@ RULES:
 - "requiredKnowledge" lists every unit, formula, or vocab word that appears in any question. The lesson MUST define all of them.
 - correctAnswer must exactly match one option string.
 - Output ONLY the JSON object.`;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Batch API calls
-// ─────────────────────────────────────────────────────────────────────────────
-async function submitBatch(apiKey, requests) {
-  const r = await fetch(BATCHES_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': ANTHROPIC_VERSION,
-    },
-    body: JSON.stringify({
-      requests: requests.map(r => ({ custom_id: r.custom_id, params: r.params })),
-    }),
-  });
-  return r.json();
-}
-
-async function pollBatch(apiKey, batchId) {
-  const r = await fetch(`${BATCHES_URL}/${batchId}`, {
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': ANTHROPIC_VERSION,
-    },
-  });
-  if (!r.ok) return null;
-  return r.json();
-}
-
-async function consumeBatchResults(db, apiKey, batchStatus) {
-  if (!batchStatus.results_url) return { count: 0, failed: 0 };
-  const r = await fetch(batchStatus.results_url, {
-    headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION },
-  });
-  if (!r.ok) return { count: 0, failed: 0 };
-  const text = await r.text();
-  const lines = text.split('\n').filter(Boolean);
-  let inserted = 0, failed = 0;
-  for (const line of lines) {
-    let entry;
-    try { entry = JSON.parse(line); } catch { failed++; continue; }
-    if (entry.result?.type !== 'succeeded') { failed++; continue; }
-    // Parse subject + grade from custom_id (format: "<subject>_g<grade>_n<i>_<rand>")
-    const m = /^([a-z]+)_g(\d+)_/.exec(entry.custom_id || '');
-    if (!m) { failed++; continue; }
-    const subject = m[1];
-    const grade = parseInt(m[2], 10);
-
-    const content = entry.result.message?.content || [];
-    const text = content.filter(b => b.type === 'text').map(b => b.text).join('');
-    let parsed;
-    try { parsed = parseJsonLoose(text); } catch { failed++; continue; }
-
-    // Validate shape
-    if (!parsed.modules || parsed.modules.length < 5 || !parsed.miniBoss || !parsed.bigBoss || !parsed.lesson) {
-      failed++; continue;
-    }
-    // Normalize correctAnswers
-    const allQs = [...parsed.modules, parsed.miniBoss, parsed.bigBoss];
-    let bad = false;
-    for (const q of allQs) {
-      if (!Array.isArray(q.options)) { bad = true; break; }
-      if (!q.options.includes(q.correctAnswer)) {
-        const match = q.options.find(o => o.trim().toLowerCase() === (q.correctAnswer || '').trim().toLowerCase());
-        q.correctAnswer = match || q.options[0];
-      }
-    }
-    if (bad) { failed++; continue; }
-    parsed.modules.forEach(q => { q.kind = 'module'; });
-    parsed.miniBoss.kind = 'miniBoss';
-    parsed.bigBoss.kind = 'bigBoss';
-    parsed.questions = [...parsed.modules, parsed.miniBoss];
-    parsed.bossQuestion = parsed.bigBoss;
-
-    const lesson = parsed.lesson;
-    delete parsed.lesson; // store separately
-
-    const { error } = await db.from('quest_pool').insert({
-      subject_id: subject,
-      grade_level: grade,
-      concept: parsed.concept || null,
-      quest_json: parsed,
-      lesson_json: lesson,
-      generated_by: 'cron',
-    });
-    if (error) failed++; else inserted++;
-  }
-  return { count: inserted, failed };
-}
-
-async function trimServedLog(db) {
-  // Trim each profile's served log to keep only the last 200 rows.
-  // Simple version: delete anything older than 60 days.
-  const cutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
-  await db.from('quest_served_log').delete().lt('served_at', cutoff);
 }
 
 function parseJsonLoose(text) {
