@@ -31,7 +31,7 @@ const ANTHROPIC_VERSION = '2023-06-01';
 
 const SUBJECTS = ['math', 'english', 'science', 'history'];
 const GRADE_PLAN = {
-  math:    [3, 4, 5, 7, 8, 9],
+  math:    [3, 4, 5, 6, 7, 8, 9],  // grade 6 added 2026-07-08: concepts.js has it; fills math_6 to target
   english: [3, 4, 5, 6, 7, 8],
   science: [3, 4, 5, 6, 7, 8],
   history: [3, 4, 5, 6, 7, 8],
