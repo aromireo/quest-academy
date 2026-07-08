@@ -29,7 +29,10 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm ci
+        # Use `npm install` (not `npm ci`) so a lockfile that's slightly out of
+        # sync with package.json doesn't fail the run. Only supabase-js is needed
+        # at runtime; this installs it reliably regardless of lockfile drift.
+        run: npm install --no-audit --no-fund
 
       - name: Run pool refill
         env:
