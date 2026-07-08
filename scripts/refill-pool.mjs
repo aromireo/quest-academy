@@ -41,8 +41,9 @@ const GRADE_PLAN = {
 const TARGET_POOL_SIZE = 45;       // active quests to keep per (subject, grade)
 const ROTATION_PER_COMBO = 15;     // retire+replace this many oldest per rotating combo
 const COMBOS_PER_RUN = 2;          // how many combos to rotate each daily run
-const CONCURRENCY = 5;             // parallel Haiku calls (no time pressure, but be polite to rate limits)
-const MAX_RETRIES = 2;             // per-quest retry on transient failure
+const CONCURRENCY = 5;             // parallel Haiku calls. The earlier 400s were a billing block,
+                                    // NOT rate limits — 5 ran 250 quests in <7min with zero throttling.
+const MAX_RETRIES = 3;             // per-quest retries for retryable (429/5xx) failures
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
@@ -206,17 +207,22 @@ async function runJobs(supa, jobs) {
     const group = jobs.slice(i, i + CONCURRENCY);
     const results = await Promise.all(group.map(j => generateOneWithRetry(supa, j)));
     for (const ok of results) { if (ok) inserted++; else failed++; }
-    // brief pause between groups to stay well under rate limits
-    if (i + CONCURRENCY < jobs.length) await sleep(400);
+    // small pause between groups (courtesy, not throttling avoidance)
+    if (i + CONCURRENCY < jobs.length) await sleep(300);
   }
   return { inserted, failed };
 }
 
 async function generateOneWithRetry(supa, job) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const ok = await generateOne(supa, job);
-    if (ok) return true;
-    if (attempt < MAX_RETRIES) await sleep(1000 * (attempt + 1));
+    const res = await generateOne(supa, job);
+    if (res.ok) return true;
+    // Don't waste retries on non-retryable errors (bad request, parse, bad shape).
+    if (!res.retryable) return false;
+    if (attempt < MAX_RETRIES) {
+      // Exponential backoff for rate-limit / overloaded: 2s, 4s, 8s.
+      await sleep(2000 * Math.pow(2, attempt));
+    }
   }
   return false;
 }
@@ -240,21 +246,32 @@ async function generateOne(supa, job) {
       }),
     });
     if (!r.ok) {
-      console.error(`[gen] ${subject}_g${grade} HTTP ${r.status}`);
-      return false;
+      // Read the actual error body so we know WHY (invalid request vs rate limit
+      // vs overloaded). Previously we only logged the status code, which hid the
+      // real cause.
+      let detail = '';
+      try { detail = await r.text(); } catch {}
+      const short = detail.slice(0, 300).replace(/\s+/g, ' ');
+      console.error(`[gen] ${subject}_g${grade} HTTP ${r.status} — ${short}`);
+      // Signal retryable conditions (rate limit / overloaded / server) to caller.
+      if (r.status === 429 || r.status === 529 || r.status >= 500) {
+        return { ok: false, retryable: true };
+      }
+      return { ok: false, retryable: false };
     }
     const data = await r.json();
     const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
 
     let parsed;
-    try { parsed = parseJsonLoose(text); } catch { return false; }
+    try { parsed = parseJsonLoose(text); } catch { return { ok: false, retryable: false }; }
 
     if (!parsed.modules || parsed.modules.length < 5 || !parsed.miniBoss || !parsed.bigBoss || !parsed.lesson) {
-      return false;
+      console.error(`[gen] ${subject}_g${grade} bad shape (missing modules/boss/lesson)`);
+      return { ok: false, retryable: false };
     }
     const allQs = [...parsed.modules, parsed.miniBoss, parsed.bigBoss];
     for (const q of allQs) {
-      if (!Array.isArray(q.options)) return false;
+      if (!Array.isArray(q.options)) return { ok: false, retryable: false };
       if (!q.options.includes(q.correctAnswer)) {
         const match = q.options.find(o => o.trim().toLowerCase() === (q.correctAnswer || '').trim().toLowerCase());
         q.correctAnswer = match || q.options[0];
@@ -277,11 +294,11 @@ async function generateOne(supa, job) {
       lesson_json: lesson,
       generated_by: 'github_action',
     });
-    if (error) { console.error(`[gen] insert failed ${subject}_g${grade}: ${error.message}`); return false; }
-    return true;
+    if (error) { console.error(`[gen] insert failed ${subject}_g${grade}: ${error.message}`); return { ok: false, retryable: false }; }
+    return { ok: true, retryable: false };
   } catch (err) {
     console.error(`[gen] ${subject}_g${grade} threw: ${err.message}`);
-    return false;
+    return { ok: false, retryable: true };
   }
 }
 

@@ -18,7 +18,7 @@ concurrency:
 jobs:
   refill:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # generous; a full cold-start fill takes only a few minutes
+    timeout-minutes: 60   # generous; cold-start backfill of 200+ quests needs headroom. Steady-state daily runs finish in minutes.
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
