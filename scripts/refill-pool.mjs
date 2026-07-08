@@ -23,6 +23,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 import { conceptFor } from '../api/_lib/concepts.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
@@ -59,10 +60,13 @@ function requireEnv() {
   }
 }
 
-// Note: no `ws`/realtime transport here. This runs in a normal Node process on
-// GitHub's runner, so the default fetch-based Supabase client is fine.
+// Provide the `ws` transport explicitly so the client works on any Node version
+// (Node < 22 has no native WebSocket, which @supabase/supabase-js needs when it
+// initializes its realtime client). The Action also runs on Node 22, so this is
+// belt-and-suspenders. This script does no realtime work — it's REST only.
 const db = () => createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
+  realtime: { transport: ws },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

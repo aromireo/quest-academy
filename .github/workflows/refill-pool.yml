@@ -26,7 +26,10 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Node 22 has native WebSocket support, which @supabase/supabase-js
+          # needs when it initializes its realtime client. Node 20 does not,
+          # and throws on createClient(). 22 avoids that entirely.
+          node-version: '22'
 
       - name: Install dependencies
         # Use `npm install` (not `npm ci`) so a lockfile that's slightly out of
