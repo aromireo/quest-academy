@@ -36,7 +36,9 @@ import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import { conceptFor } from './_lib/concepts.js';
 
-export const config = { maxDuration: 55 };
+// Fluid Compute is ENABLED on this project and the Function Max Duration default
+// is 300s (confirmed in Settings → Functions, 2026-07-06). 300s is build-safe here.
+export const config = { maxDuration: 300 };
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -54,7 +56,8 @@ const TARGET_POOL_SIZE = 45;       // active quests to keep per (subject, grade)
 const ROTATION_PER_COMBO = 15;     // when rotating, retire+replace this many oldest
 const COMBOS_PER_DAY = 2;          // how many combos to rotate per daily run
 const REFRESH_INTERVAL_DAYS = 14;  // full-fleet rotation cadence (spread across days)
-const MAX_GEN_PER_RUN = 30;        // hard cap per invocation — ~40s at 5-wide, safe under 55s
+const MAX_GEN_PER_RUN = 25;        // ~40-70s wall-clock at 5-wide — safe under the 300s ceiling.
+                                    // Cold-start fill: ~14 runs. Or hit ?secret=...&run=1 to accelerate.
 const GEN_CONCURRENCY = 5;         // parallel Haiku calls per group
 
 export default async function handler(req, res) {
