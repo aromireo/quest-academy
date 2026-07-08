@@ -1,0 +1,39 @@
+name: Refill Quest Pool
+
+# Runs the pool generator on GitHub's servers (6-hour limit — no Vercel 60s ceiling).
+# Fills starved pools and rotates stale quests once per day.
+
+on:
+  # Daily at 07:00 UTC (same cadence the old Vercel cron used).
+  schedule:
+    - cron: '0 7 * * *'
+  # Manual "Run workflow" button in the Actions tab — use this to fill on demand.
+  workflow_dispatch:
+
+# Prevent two runs overlapping (e.g. a manual run during the scheduled one).
+concurrency:
+  group: refill-pool
+  cancel-in-progress: false
+
+jobs:
+  refill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # generous; a full cold-start fill takes only a few minutes
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run pool refill
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/refill-pool.mjs
