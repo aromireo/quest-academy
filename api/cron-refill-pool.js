@@ -56,8 +56,12 @@ const TARGET_POOL_SIZE = 45;       // active quests to keep per (subject, grade)
 const ROTATION_PER_COMBO = 15;     // when rotating, retire+replace this many oldest
 const COMBOS_PER_DAY = 2;          // how many combos to rotate per daily run
 const REFRESH_INTERVAL_DAYS = 14;  // full-fleet rotation cadence (spread across days)
-const MAX_GEN_PER_RUN = 25;        // ~40-70s wall-clock at 5-wide — safe under the 300s ceiling.
-                                    // Cold-start fill: ~14 runs. Or hit ?secret=...&run=1 to accelerate.
+// SIZED FROM LOG EVIDENCE (2026-07-08): 25 gens measured at ~56s wall-clock and hit
+// a hard 60s ceiling (maxDuration:300 is NOT applying — see the "Node.Js Version
+// Override" warning on the deployment; extended duration needs a supported Node
+// runtime). 12 gens ≈ 25-30s at 5-wide — safely inside 60s with margin.
+// If you fix the Node version so 300s takes effect, you can raise this to ~25.
+const MAX_GEN_PER_RUN = 12;
 const GEN_CONCURRENCY = 5;         // parallel Haiku calls per group
 
 export default async function handler(req, res) {
