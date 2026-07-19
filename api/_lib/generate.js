@@ -37,7 +37,10 @@ function difficultyLabel(level) {
   return labels[level] || `Grade ${level}`;
 }
 
-async function callClaude({ model = 'claude-sonnet-4-6', system, user, maxTokens = 2400 }) {
+// v13: default changed from claude-sonnet-4-6 to Haiku. pool.js calls this on
+// the live-fallback path; every pool miss was silently generating on Sonnet at
+// ~15x the cost. Callers may still pass an explicit model to override.
+async function callClaude({ model = 'claude-haiku-4-5-20251001', system, user, maxTokens = 2400 }) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY missing');
 

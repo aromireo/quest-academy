@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { SUBJECTS, BADGES, BASE_GRADE, STARTING_LEVELS, getLevel } from './lib/constants.js'
 import { loadProfiles, saveProfile, deleteProfile, saveQuestResult, loadQuestHistory } from './lib/supabase.js'
-import { fetchPoolQuest, generateExplanation, generateStretchQuestion, calcNextDifficulty } from './lib/claude.js'
+import { fetchPoolQuest, generateExplanation, generateStretchQuestion, calcNextDifficulty, resetStretchBudget } from './lib/claude.js'
 import HomeScreen from './pages/HomeScreen.jsx'
 import SetupScreen from './pages/SetupScreen.jsx'
 import ProfileScreen from './pages/ProfileScreen.jsx'
@@ -227,6 +227,7 @@ export default function App() {
     setFollowupChecked(false)
     setStreak(0)
     setWrongCount(0)
+    resetStretchBudget()
     setStretchOffer(null)
     setStretchAnswered(null)
 

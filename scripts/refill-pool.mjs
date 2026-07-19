@@ -1,49 +1,51 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// scripts/refill-pool.mjs
+// scripts/refill-pool.mjs  —  v13
 //
-// Pool generator that runs on GitHub Actions (NOT on Vercel), so it has NO
-// 60-second ceiling — GitHub Actions allow up to 6 hours. It fills starved
-// pools and rotates stale quests in ONE clean pass, then exits.
+// Runs on GitHub Actions (no 60s ceiling). Fills starved pools and rotates
+// stale quests, then exits.
 //
-// This REPLACES the generation role of api/cron-refill-pool.js and
-// api/bootstrap-pool.js. Vercel now only SERVES quests (api/pool.js); it no
-// longer generates them.
+// v13 changes (all driven by confirmed evidence, not speculation):
+//   1. SCOPED GENERATION. Combos are derived from the profiles table — each
+//      child's working grade per subject, plus one grade above (so promotion
+//      never hits an empty pool). Was 25 hardcoded combos; now ~16 real ones.
+//   2. SPLIT QUEST / LESSON. v12 asked for both in ONE call at max_tokens=2400.
+//      Confirmed via stop_reason=max_tokens: the lesson block overran the
+//      ceiling and truncated the JSON, so parseJsonLoose threw and a fully
+//      formed quest was discarded AFTER being paid for. Now two calls.
+//   3. LESSON CACHE. A lesson belongs to a CONCEPT, not a quest. All quests on
+//      "Surface area using nets" share one lesson. Generated once, reused.
+//   4. RETIREMENT FIX. v12 ordered by `created_at`, which does not exist on
+//      quest_pool (the column is `generated_at`). The select errored silently,
+//      ids came back empty, and NOTHING was ever retired — while `need` was
+//      still computed as if retirement had succeeded, so it generated 15 quests
+//      into already-full pools every run. Both halves are fixed here.
+//   5. Errors on the retire select are now checked and logged.
 //
-// Reuses api/_lib/concepts.js (imported, not copied) so the concept bank lives
-// in exactly one place.
-//
-// Env (provided by the GitHub Actions workflow from repo secrets):
-//   ANTHROPIC_API_KEY
-//   SUPABASE_URL                (your Supabase project URL)
-//   SUPABASE_SERVICE_ROLE_KEY   (service role key)
-//
-// Run locally for testing:
-//   ANTHROPIC_API_KEY=... SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... \
-//     node scripts/refill-pool.mjs
+// Env (from GitHub repo secrets):
+//   ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
-import { conceptFor } from '../api/_lib/concepts.js';
+import { conceptFor, conceptCount } from '../api/_lib/concepts.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
+const MODEL = 'claude-haiku-4-5-20251001';
 
 const SUBJECTS = ['math', 'english', 'science', 'history'];
-const GRADE_PLAN = {
-  math:    [3, 4, 5, 6, 7, 8, 9],  // grade 6 added 2026-07-08: concepts.js has it; fills math_6 to target
-  english: [3, 4, 5, 6, 7, 8],
-  science: [3, 4, 5, 6, 7, 8],
-  history: [3, 4, 5, 6, 7, 8],
-};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const TARGET_POOL_SIZE = 45;       // active quests to keep per (subject, grade)
-const ROTATION_PER_COMBO = 15;     // retire+replace this many oldest per rotating combo
-const COMBOS_PER_RUN = 2;          // how many combos to rotate each daily run
-const CONCURRENCY = 5;             // parallel Haiku calls. The earlier 400s were a billing block,
-                                    // NOT rate limits — 5 ran 250 quests in <7min with zero throttling.
-const MAX_RETRIES = 3;             // per-quest retries for retryable (429/5xx) failures
+const TARGET_POOL_SIZE = 30;       // was 45. With ~16 scoped combos this is
+                                    // still ~4 weeks of quests per combo at
+                                    // 1/day, and cuts backfill cost sharply.
+const ROTATION_PER_COMBO = 10;
+const COMBOS_PER_RUN = 4;           // 4 of ~16 => full turnover every ~4 days
+const CONCURRENCY = 5;
+const MAX_RETRIES = 3;
+
+const QUEST_MAX_TOKENS = 2000;      // quest only, no lesson block — fits easily
+const LESSON_MAX_TOKENS = 1100;
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
@@ -61,10 +63,6 @@ function requireEnv() {
   }
 }
 
-// Provide the `ws` transport explicitly so the client works on any Node version
-// (Node < 22 has no native WebSocket, which @supabase/supabase-js needs when it
-// initializes its realtime client). The Action also runs on Node 22, so this is
-// belt-and-suspenders. This script does no realtime work — it's REST only.
 const db = () => createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
   realtime: { transport: ws },
@@ -75,18 +73,24 @@ async function main() {
   requireEnv();
   const supa = db();
   const startedAt = Date.now();
-  console.log(`[refill] start ${new Date().toISOString()}`);
+  console.log(`[refill] start ${new Date().toISOString()} (v13)`);
 
-  const counts = await getCounts(supa);
-  logCounts(counts);
+  // ─── Scope: derive combos from real profiles ───────────────────────────────
+  const combos = await getScopedCombos(supa);
+  if (combos.length === 0) {
+    console.error('[refill] no profiles found — cannot determine scope. Exiting.');
+    process.exit(1);
+  }
+  console.log(`[refill] scope: ${combos.length} combos — ${combos.map(c => `${c.subject}_g${c.grade}`).join(', ')}`);
+
+  const counts = await getCounts(supa, combos);
+  logCounts(counts, combos);
 
   let state = await loadState(supa);
 
-  // ─── PHASE 1: self-heal — fill EVERY starved combo to target, in one pass ───
-  // No 60s ceiling here, so we don't cap the number of generations. We fill the
-  // whole backlog. (A cold start of ~345 quests takes a few minutes — fine.)
+  // ─── PHASE 1: self-heal ────────────────────────────────────────────────────
   const starved = [];
-  for (const { subject, grade } of allCombos()) {
+  for (const { subject, grade } of combos) {
     const active = counts[key(subject, grade)] || 0;
     const deficit = TARGET_POOL_SIZE - active;
     if (deficit > 0) starved.push({ subject, grade, active, deficit });
@@ -109,77 +113,87 @@ async function main() {
     console.log('[refill] no starved combos — pools at/above target');
   }
 
-  // ─── PHASE 2: rolling rotation — retire oldest + regenerate for a slice ─────
-  // Only rotate combos that are actually at/above target (don't rotate a combo
-  // we just healed; leave it fresh). Advance a rolling cursor so the whole fleet
-  // turns over every ~13 days at 2 combos/run.
-  const combos = allCombos();
+  // ─── PHASE 2: rolling rotation ─────────────────────────────────────────────
   let cursor = Number.isInteger(state.rotation_cursor) ? state.rotation_cursor : 0;
+  cursor = cursor % combos.length;
 
   let rotRetired = 0, rotInserted = 0, rotFailed = 0;
   const rotatedSlice = [];
-  // Re-fetch counts if we healed, so rotation sees the updated numbers.
-  const postHealCounts = healInserted > 0 ? await getCounts(supa) : counts;
+  const postHealCounts = healInserted > 0 ? await getCounts(supa, combos) : counts;
 
   let advanced = 0;
   for (let step = 0; step < combos.length && advanced < COMBOS_PER_RUN; step++) {
     const combo = combos[(cursor + step) % combos.length];
     const active = postHealCounts[key(combo.subject, combo.grade)] || 0;
-    // Skip combos still below target (they were just healed or generation failed);
-    // rotating them would only shrink them.
     if (active < TARGET_POOL_SIZE) continue;
 
     advanced++;
     rotatedSlice.push(`${combo.subject}_g${combo.grade}`);
 
+    // Retire oldest. NOTE: column is generated_at, NOT created_at (v12 bug).
     const retire = Math.min(ROTATION_PER_COMBO, active);
+    let actuallyRetired = 0;
     if (retire > 0) {
-      const { data: oldest } = await supa
+      const { data: oldest, error: selErr } = await supa
         .from('quest_pool')
         .select('id')
         .eq('subject_id', combo.subject)
         .eq('grade_level', combo.grade)
         .eq('is_active', true)
-        .order('created_at', { ascending: true })
+        .order('generated_at', { ascending: true })
         .limit(retire);
-      const ids = (oldest || []).map(r => r.id);
-      if (ids.length) {
-        const { error } = await supa.from('quest_pool').update({ is_active: false }).in('id', ids);
-        if (!error) rotRetired += ids.length;
-        else console.error(`[refill] retire failed for ${combo.subject}_g${combo.grade}: ${error.message}`);
+
+      if (selErr) {
+        // v12 swallowed this. Never again.
+        console.error(`[refill] retire SELECT failed for ${combo.subject}_g${combo.grade}: ${selErr.message}`);
+      } else {
+        const ids = (oldest || []).map(r => r.id);
+        if (ids.length) {
+          const { error: updErr } = await supa
+            .from('quest_pool').update({ is_active: false }).in('id', ids);
+          if (updErr) {
+            console.error(`[refill] retire UPDATE failed for ${combo.subject}_g${combo.grade}: ${updErr.message}`);
+          } else {
+            actuallyRetired = ids.length;
+            rotRetired += actuallyRetired;
+          }
+        }
       }
     }
 
-    const afterRetire = Math.max(0, active - retire);
+    // Base `need` on what was ACTUALLY retired, not what we intended to retire.
+    // v12 assumed success here and generated into already-full pools.
+    const afterRetire = Math.max(0, active - actuallyRetired);
     const need = Math.max(0, TARGET_POOL_SIZE - afterRetire);
+    if (need === 0) {
+      console.log(`[refill] ${combo.subject}_g${combo.grade}: retired ${actuallyRetired}, pool still at ${afterRetire} — nothing to generate`);
+      continue;
+    }
     const jobs = [];
     for (let i = 0; i < need; i++) {
       jobs.push({ subject: combo.subject, grade: combo.grade, conceptIndex: afterRetire + i });
     }
-    if (jobs.length) {
-      const r = await runJobs(supa, jobs);
-      rotInserted += r.inserted; rotFailed += r.failed;
-    }
+    const r = await runJobs(supa, jobs);
+    rotInserted += r.inserted; rotFailed += r.failed;
   }
-  // Advance cursor past what we examined so next run continues the sweep.
+
   cursor = (cursor + COMBOS_PER_RUN) % combos.length;
   console.log(`[refill] rotation: slice=${JSON.stringify(rotatedSlice)} retired=${rotRetired} +${rotInserted} (failed ${rotFailed})`);
 
-  // ─── Housekeeping + state ──────────────────────────────────────────────────
   await trimServedLog(supa);
 
   state = {
     ...state,
     rotation_cursor: cursor,
-    generator: 'github_action',
+    generator: 'github_action_v13',
     last_run_at: new Date().toISOString(),
+    last_scope_size: combos.length,
     last_self_heal_inserted: healInserted,
     last_self_heal_failed: healFailed,
     last_rotation_slice: rotatedSlice,
     last_rotation_retired: rotRetired,
     last_rotation_inserted: rotInserted,
     last_rotation_failed: rotFailed,
-    // clear any stale v11 batch fields so cron_state is clean
     pending_batch_id: null,
     pending_batch_submitted_at: null,
     pending_batch_request_count: null,
@@ -189,13 +203,44 @@ async function main() {
   const secs = ((Date.now() - startedAt) / 1000).toFixed(0);
   console.log(`[refill] DONE in ${secs}s — heal +${healInserted}, rotate +${rotInserted}, retired ${rotRetired}`);
 
-  // Non-zero exit if EVERYTHING failed (so the Action shows red and you notice).
   const totalInserted = healInserted + rotInserted;
   const totalFailed = healFailed + rotFailed;
   if (totalInserted === 0 && totalFailed > 0) {
-    console.error('[refill] all generations failed — check ANTHROPIC_API_KEY / rate limits');
+    console.error('[refill] all generations failed — check ANTHROPIC_API_KEY / balance / rate limits');
     process.exit(1);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scope: which (subject, grade) combos are actually in use?
+// Each profile's working grade per subject, plus one above.
+// ─────────────────────────────────────────────────────────────────────────────
+async function getScopedCombos(supa) {
+  const { data: profiles, error } = await supa
+    .from('profiles')
+    .select('difficulty_levels, base_grade_num');
+
+  if (error) {
+    console.error(`[refill] profiles read failed: ${error.message}`);
+    return [];
+  }
+
+  const set = new Set();
+  for (const p of profiles || []) {
+    for (const subject of SUBJECTS) {
+      const base = Number(p?.difficulty_levels?.[subject]) || Number(p?.base_grade_num) || 6;
+      for (const grade of [base, base + 1]) {
+        if (grade < 1 || grade > 12) continue;
+        // Only include combos we have a concept bank for.
+        if (conceptCount(subject, grade) === 0) continue;
+        set.add(`${subject}|${grade}`);
+      }
+    }
+  }
+
+  return [...set]
+    .map(s => { const [subject, g] = s.split('|'); return { subject, grade: Number(g) }; })
+    .sort((a, b) => a.subject.localeCompare(b.subject) || a.grade - b.grade);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,7 +252,6 @@ async function runJobs(supa, jobs) {
     const group = jobs.slice(i, i + CONCURRENCY);
     const results = await Promise.all(group.map(j => generateOneWithRetry(supa, j)));
     for (const ok of results) { if (ok) inserted++; else failed++; }
-    // small pause between groups (courtesy, not throttling avoidance)
     if (i + CONCURRENCY < jobs.length) await sleep(300);
   }
   return { inserted, failed };
@@ -217,62 +261,67 @@ async function generateOneWithRetry(supa, job) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const res = await generateOne(supa, job);
     if (res.ok) return true;
-    // Don't waste retries on non-retryable errors (bad request, parse, bad shape).
     if (!res.retryable) return false;
-    if (attempt < MAX_RETRIES) {
-      // Exponential backoff for rate-limit / overloaded: 2s, 4s, 8s.
-      await sleep(2000 * Math.pow(2, attempt));
-    }
+    if (attempt < MAX_RETRIES) await sleep(2000 * Math.pow(2, attempt));
   }
   return false;
+}
+
+async function callAnthropic(system, user, maxTokens) {
+  const r = await fetch(ANTHROPIC_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_KEY,
+      'anthropic-version': ANTHROPIC_VERSION,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: user }],
+    }),
+  });
+  return r;
 }
 
 async function generateOne(supa, job) {
   const { subject, grade, conceptIndex } = job;
   const concept = conceptFor(subject, grade, conceptIndex);
+
   try {
-    const r = await fetch(ANTHROPIC_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': ANTHROPIC_VERSION,
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 2400,
-        system: 'You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }.',
-        messages: [{ role: 'user', content: questPrompt(subject, grade, concept) }],
-      }),
-    });
+    // ─── Call 1: the quest (no lesson block) ─────────────────────────────────
+    const r = await callAnthropic(
+      'You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }.',
+      questPrompt(subject, grade, concept),
+      QUEST_MAX_TOKENS
+    );
+
     if (!r.ok) {
-      // Read the actual error body so we know WHY (invalid request vs rate limit
-      // vs overloaded). Previously we only logged the status code, which hid the
-      // real cause.
       let detail = '';
       try { detail = await r.text(); } catch {}
-      const short = detail.slice(0, 300).replace(/\s+/g, ' ');
-      console.error(`[gen] ${subject}_g${grade} HTTP ${r.status} — ${short}`);
-      // Signal retryable conditions (rate limit / overloaded / server) to caller.
-      if (r.status === 429 || r.status === 529 || r.status >= 500) {
-        return { ok: false, retryable: true };
-      }
+      console.error(`[gen] ${subject}_g${grade} HTTP ${r.status} — ${detail.slice(0, 300).replace(/\s+/g, ' ')}`);
+      if (r.status === 429 || r.status === 529 || r.status >= 500) return { ok: false, retryable: true };
       return { ok: false, retryable: false };
     }
+
     const data = await r.json();
     const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
 
     let parsed;
-    try { parsed = parseJsonLoose(text); }
-    catch {
-      console.error(`[gen] ${subject}_g${grade} PARSE FAIL — stop_reason=${data.stop_reason} out_tokens=${data.usage?.output_tokens} tail=${JSON.stringify(text.slice(-200))}`);
+    try {
+      parsed = parseJsonLoose(text);
+    } catch {
+      console.error(`[gen] ${subject}_g${grade} PARSE FAIL — stop_reason=${data.stop_reason} out_tokens=${data.usage?.output_tokens} tail=${JSON.stringify(text.slice(-160))}`);
+      // Truncation is retryable: a re-roll usually fits.
+      return { ok: false, retryable: data.stop_reason === 'max_tokens' };
+    }
+
+    if (!parsed.modules || parsed.modules.length < 5 || !parsed.miniBoss || !parsed.bigBoss) {
+      console.error(`[gen] ${subject}_g${grade} bad shape (missing modules/boss)`);
       return { ok: false, retryable: false };
     }
 
-    if (!parsed.modules || parsed.modules.length < 5 || !parsed.miniBoss || !parsed.bigBoss || !parsed.lesson) {
-      console.error(`[gen] ${subject}_g${grade} bad shape (missing modules/boss/lesson)`);
-      return { ok: false, retryable: false };
-    }
     const allQs = [...parsed.modules, parsed.miniBoss, parsed.bigBoss];
     for (const q of allQs) {
       if (!Array.isArray(q.options)) return { ok: false, retryable: false };
@@ -287,18 +336,27 @@ async function generateOne(supa, job) {
     parsed.questions = [...parsed.modules, parsed.miniBoss];
     parsed.bossQuestion = parsed.bigBoss;
 
-    const lesson = parsed.lesson;
-    delete parsed.lesson;
+    const conceptName = parsed.concept || concept || 'General';
+
+    // ─── Call 2: the lesson — ONLY if not already cached for this concept ────
+    const lesson = await getOrCreateLesson(supa, subject, grade, conceptName, parsed);
+    if (!lesson) {
+      console.error(`[gen] ${subject}_g${grade} lesson unavailable for "${conceptName}"`);
+      return { ok: false, retryable: false };
+    }
 
     const { error } = await supa.from('quest_pool').insert({
       subject_id: subject,
       grade_level: grade,
-      concept: parsed.concept || null,
+      concept: conceptName,
       quest_json: parsed,
       lesson_json: lesson,
-      generated_by: 'github_action',
+      generated_by: 'github_action_v13',
     });
-    if (error) { console.error(`[gen] insert failed ${subject}_g${grade}: ${error.message}`); return { ok: false, retryable: false }; }
+    if (error) {
+      console.error(`[gen] insert failed ${subject}_g${grade}: ${error.message}`);
+      return { ok: false, retryable: false };
+    }
     return { ok: true, retryable: false };
   } catch (err) {
     console.error(`[gen] ${subject}_g${grade} threw: ${err.message}`);
@@ -306,21 +364,69 @@ async function generateOne(supa, job) {
   }
 }
 
+// A lesson belongs to a concept, not a quest. Generate once, reuse forever.
+async function getOrCreateLesson(supa, subject, grade, concept, quest) {
+  const { data: cached } = await supa
+    .from('lesson_cache')
+    .select('lesson_json')
+    .eq('subject_id', subject)
+    .eq('grade_level', grade)
+    .eq('concept', concept)
+    .maybeSingle();
+
+  if (cached?.lesson_json) return cached.lesson_json;
+
+  const r = await callAnthropic(
+    'You are a sharp, direct tutor writing a pre-quest lesson. Output ONLY raw JSON. No markdown, no code fences. Start with { and end with }.',
+    lessonPrompt(subject, grade, concept, quest),
+    LESSON_MAX_TOKENS
+  );
+  if (!r.ok) {
+    let detail = '';
+    try { detail = await r.text(); } catch {}
+    console.error(`[lesson] ${subject}_g${grade} HTTP ${r.status} — ${detail.slice(0, 200).replace(/\s+/g, ' ')}`);
+    return null;
+  }
+
+  const data = await r.json();
+  const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+
+  let lesson;
+  try {
+    lesson = parseJsonLoose(text);
+  } catch {
+    console.error(`[lesson] ${subject}_g${grade} PARSE FAIL — stop_reason=${data.stop_reason} out_tokens=${data.usage?.output_tokens}`);
+    return null;
+  }
+
+  const shaped = {
+    topic: lesson.topic || concept,
+    hook: lesson.hook || '',
+    lesson: lesson.lesson || '',
+    watchOut: lesson.watchOut || '',
+    keyTerms: Array.isArray(lesson.keyTerms) ? lesson.keyTerms : [],
+  };
+
+  // Race-safe: two parallel jobs on the same concept may both reach here.
+  const { error } = await supa.from('lesson_cache').upsert({
+    subject_id: subject,
+    grade_level: grade,
+    concept,
+    lesson_json: shaped,
+  }, { onConflict: 'subject_id,grade_level,concept' });
+  if (error) console.error(`[lesson] cache write failed: ${error.message}`);
+
+  return shaped;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DB helpers
 // ─────────────────────────────────────────────────────────────────────────────
-function allCombos() {
-  const out = [];
-  for (const subject of SUBJECTS) {
-    for (const grade of (GRADE_PLAN[subject] || [])) out.push({ subject, grade });
-  }
-  return out;
-}
 function key(subject, grade) { return `${subject}_${grade}`; }
 
-async function getCounts(supa) {
+async function getCounts(supa, combos) {
   const counts = {};
-  for (const { subject, grade } of allCombos()) {
+  for (const { subject, grade } of combos) {
     const { count } = await supa
       .from('quest_pool')
       .select('id', { count: 'exact', head: true })
@@ -332,18 +438,15 @@ async function getCounts(supa) {
   return counts;
 }
 
-function logCounts(counts) {
+function logCounts(counts, combos) {
   const below = Object.entries(counts).filter(([, v]) => v < TARGET_POOL_SIZE);
-  console.log(`[refill] pool state: ${Object.keys(counts).length} combos, ${below.length} below target ${TARGET_POOL_SIZE}`);
+  console.log(`[refill] pool state: ${combos.length} combos, ${below.length} below target ${TARGET_POOL_SIZE}`);
   if (below.length) console.log(`[refill] below target: ${below.map(([k, v]) => `${k}=${v}`).join(', ')}`);
 }
 
 async function loadState(supa) {
   const { data } = await supa
-    .from('cron_state')
-    .select('value')
-    .eq('key', 'pool_refresh')
-    .maybeSingle();
+    .from('cron_state').select('value').eq('key', 'pool_refresh').maybeSingle();
   return data?.value || { rotation_cursor: 0 };
 }
 
@@ -360,7 +463,7 @@ async function trimServedLog(supa) {
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Prompt + parse (same shape bootstrap/cron produced, so pool.js reads it identically)
+// Prompts
 // ─────────────────────────────────────────────────────────────────────────────
 function questPrompt(subjectId, gradeLevel, assignedConcept) {
   const labels = { math: 'Math', english: 'English / Language Arts', science: 'Science', history: 'History' };
@@ -368,6 +471,7 @@ function questPrompt(subjectId, gradeLevel, assignedConcept) {
   const conceptLine = assignedConcept
     ? `THE CONCEPT FOR THIS QUEST IS: "${assignedConcept}". All 7 questions must test this exact concept. Do not choose a different topic.`
     : `Pick ONE focused concept appropriate for Grade ${gradeLevel} ${subject}. ALL 7 questions must test that single concept.`;
+
   return `Generate a ${subject} quest at Grade ${gradeLevel} curriculum level.
 
 IMPORTANT: Match content to Grade ${gradeLevel} curriculum standards exactly. The student is genuinely working at this level — make questions challenging but fair.
@@ -380,8 +484,6 @@ STRUCTURE:
 - 5 "module" questions (progressive practice).
 - 1 "miniBoss" (synthesis).
 - 1 "bigBoss" (transfer to new context).
-
-ALSO write the lesson card inside this same JSON under the "lesson" key.
 
 Output this exact JSON:
 {
@@ -399,20 +501,40 @@ Output this exact JSON:
     {"id":5,"question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"correctAnswer":"D) ...","explanation":"..."}
   ],
   "miniBoss": {"id":"mini","question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"correctAnswer":"...","explanation":"..."},
-  "bigBoss": {"id":"big","question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"correctAnswer":"...","explanation":"..."},
-  "lesson": {
-    "topic": "Short topic name (≤ 5 words)",
-    "hook": "One opening sentence — fun fact or 'why this matters'",
-    "lesson": "2-3 short paragraphs explaining the core concept clearly with one concrete worked example. Define every term in requiredKnowledge. Under 220 words total.",
-    "watchOut": "One sentence about a common mistake students make on this topic",
-    "keyTerms": [{"term": "...", "definition": "..."}]
-  }
+  "bigBoss": {"id":"big","question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"correctAnswer":"...","explanation":"..."}
 }
 
 RULES:
-- "requiredKnowledge" lists every unit, formula, or vocab word that appears in any question. The lesson MUST define all of them.
+- "requiredKnowledge" lists every unit, formula, or vocab word that appears in any question.
 - correctAnswer must exactly match one option string.
+- Keep every "explanation" to ONE sentence.
 - Output ONLY the JSON object.`;
+}
+
+function lessonPrompt(subjectId, gradeLevel, concept, quest) {
+  const labels = { math: 'Math', english: 'English / Language Arts', science: 'Science', history: 'History' };
+  const subject = labels[subjectId] || subjectId;
+  const required = (quest?.requiredKnowledge || []).join(', ');
+
+  return `Write the lesson card for a Grade ${gradeLevel} ${subject} quest.
+
+Concept: ${concept}
+What's tested: ${quest?.conceptSummary || concept}
+Terms/units/formulas the student will encounter: ${required || '(none specific)'}
+
+Teach every term listed above. Include one concrete worked example with step-by-step reasoning. Do not dumb it down.
+
+Return JSON:
+{
+  "topic": "Short topic name (max 5 words)",
+  "hook": "One opening sentence — why this matters or a surprising fact",
+  "lesson": "2-3 short paragraphs: core concept, then a worked example, then the key nuance to watch. Under 200 words.",
+  "watchOut": "One sentence on the most common mistake",
+  "keyTerms": [{"term": "...", "definition": "..."}]
+}
+
+Include at most 4 keyTerms. Use "the student" or {NAME} if referring to a student.
+Output ONLY the JSON object.`;
 }
 
 function parseJsonLoose(text) {

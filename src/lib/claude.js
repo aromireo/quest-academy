@@ -149,8 +149,16 @@ async function callClaudeRaw({ model, system, user, maxTokens, timeoutMs = 30_00
 // After this many wrong answers in a session, switch from Sonnet to Haiku.
 const SONNET_WRONG_ANSWER_CAP = 3;
 
-async function callClaude({ system, user, maxTokens = 800, wrongCount = 0 }) {
-  const useHaiku = wrongCount >= SONNET_WRONG_ANSWER_CAP;
+// v13: stretch questions were uncapped and ran on Sonnet — they fired on every
+// 3rd correct answer with no session limit, which was the largest uncapped
+// Sonnet cost in the app. Stretch questions are generic (no per-student
+// reasoning), so Haiku is the right model and a session cap is appropriate.
+const STRETCH_MAX_PER_SESSION = 2;
+let stretchCountThisSession = 0;
+export function resetStretchBudget() { stretchCountThisSession = 0; }
+
+async function callClaude({ system, user, maxTokens = 800, wrongCount = 0, forceHaiku = false }) {
+  const useHaiku = forceHaiku || wrongCount >= SONNET_WRONG_ANSWER_CAP;
   const primaryModel = useHaiku ? MODEL_FALLBACK : MODEL_PRIMARY;
   try {
     const data = await callClaudeRaw({
@@ -294,8 +302,12 @@ Return JSON:
 
 Genuinely harder — a real stretch, not just trickier wording. Output ONLY the JSON object.`;
 
+  if (stretchCountThisSession >= STRETCH_MAX_PER_SESSION) return null;
+  stretchCountThisSession++;
+
   try {
-    const result = await callClaude({ system, user: prompt, maxTokens: 500 });
+    // forceHaiku: stretch questions don't need Sonnet-level reasoning.
+    const result = await callClaude({ system, user: prompt, maxTokens: 500, forceHaiku: true });
     if (!result.options || !Array.isArray(result.options) || !result.correctAnswer) {
       throw new Error('Malformed stretch question');
     }
