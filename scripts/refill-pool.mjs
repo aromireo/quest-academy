@@ -263,7 +263,11 @@ async function generateOne(supa, job) {
     const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
 
     let parsed;
-    try { parsed = parseJsonLoose(text); } catch { return { ok: false, retryable: false }; }
+    try { parsed = parseJsonLoose(text); }
+    catch {
+      console.error(`[gen] ${subject}_g${grade} PARSE FAIL — stop_reason=${data.stop_reason} out_tokens=${data.usage?.output_tokens} tail=${JSON.stringify(text.slice(-200))}`);
+      return { ok: false, retryable: false };
+    }
 
     if (!parsed.modules || parsed.modules.length < 5 || !parsed.miniBoss || !parsed.bigBoss || !parsed.lesson) {
       console.error(`[gen] ${subject}_g${grade} bad shape (missing modules/boss/lesson)`);
