@@ -36,7 +36,7 @@ const MODEL = 'claude-haiku-4-5-20251001';
 const SUBJECTS = ['math', 'english', 'science', 'history'];
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const TARGET_POOL_SIZE = 30;       // was 45. With ~16 scoped combos this is
+const TARGET_POOL_SIZE = 45;       // was 45. With ~16 scoped combos this is
                                     // still ~4 weeks of quests per combo at
                                     // 1/day, and cuts backfill cost sharply.
 const ROTATION_PER_COMBO = 10;
