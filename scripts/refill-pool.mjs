@@ -21,6 +21,18 @@
 //      into already-full pools every run. Both halves are fixed here.
 //   5. Errors on the retire select are now checked and logged.
 //
+//   v13.1 (variety fix): confirmed via kid-facing feedback that quests on the
+//   same concept felt repetitive even though they weren't literal duplicates.
+//   Root cause: conceptFor() cycles a fixed list, and the prompt had no
+//   variation beyond the concept name — same concept in, same framing out.
+//   Two additions, both evidence-driven rather than cosmetic:
+//     a. SCENARIO_POOL — a random real-world setting is injected per
+//        generation so the same concept gets a genuinely different surface
+//        (a bake sale vs. a rocket launch vs. a road trip).
+//     b. Recent quest titles/summaries for that exact (subject, grade,
+//        concept) are pulled from the pool and given to Haiku as explicit
+//        "already used, do not repeat" examples.
+//
 // Env (from GitHub repo secrets):
 //   ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,6 +46,24 @@ const ANTHROPIC_VERSION = '2023-06-01';
 const MODEL = 'claude-haiku-4-5-20251001';
 
 const SUBJECTS = ['math', 'english', 'science', 'history'];
+
+// v13.1: real-world settings used to vary the surface of a quest without
+// changing the underlying concept. Deliberately broad so it fits math word
+// problems, science scenarios, English passages, and history "what if you
+// were there" framings alike.
+const SCENARIO_POOL = [
+  'a school bake sale', 'a rocket launch', 'a video game leaderboard',
+  'a road trip', 'a community garden', 'a sports tournament',
+  'a music festival', 'a robotics competition', 'a treasure hunt',
+  'scaling a recipe for a big group', 'running a small business',
+  'a science fair', 'building something (construction/engineering)',
+  'an amusement park', 'exploring the ocean', 'a weather forecast',
+  'planning a trip to space', 'a wildlife survey', 'designing a video game',
+  'a neighborhood fundraiser',
+];
+function randomScenario() {
+  return SCENARIO_POOL[Math.floor(Math.random() * SCENARIO_POOL.length)];
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const TARGET_POOL_SIZE = 30;       // was 45. With ~16 scoped combos this is
@@ -290,10 +320,16 @@ async function generateOne(supa, job) {
   const concept = conceptFor(subject, grade, conceptIndex);
 
   try {
+    // v13.1: pull recent quests on this exact concept so Haiku doesn't reuse
+    // the same scenario/numbers, and pick a random real-world setting so the
+    // surface varies even when the concept repeats.
+    const recentTitles = await getRecentTitlesForConcept(supa, subject, grade, concept);
+    const scenario = randomScenario();
+
     // ─── Call 1: the quest (no lesson block) ─────────────────────────────────
     const r = await callAnthropic(
       'You are a quiz generator for an adaptive learning app. Output ONLY raw JSON. No markdown, no explanation, no code fences. Start with { and end with }.',
-      questPrompt(subject, grade, concept),
+      questPrompt(subject, grade, concept, scenario, recentTitles),
       QUEST_MAX_TOKENS
     );
 
@@ -444,6 +480,24 @@ function logCounts(counts, combos) {
   if (below.length) console.log(`[refill] below target: ${below.map(([k, v]) => `${k}=${v}`).join(', ')}`);
 }
 
+// v13.1: recent titles/summaries for this exact concept, used as
+// "already used, don't repeat" examples in the prompt.
+async function getRecentTitlesForConcept(supa, subject, grade, concept) {
+  if (!concept) return [];
+  const { data, error } = await supa
+    .from('quest_pool')
+    .select('quest_json')
+    .eq('subject_id', subject)
+    .eq('grade_level', grade)
+    .eq('concept', concept)
+    .order('generated_at', { ascending: false })
+    .limit(5);
+  if (error || !data) return [];
+  return data
+    .map(r => r.quest_json?.questTitle || r.quest_json?.conceptSummary)
+    .filter(Boolean);
+}
+
 async function loadState(supa) {
   const { data } = await supa
     .from('cron_state').select('value').eq('key', 'pool_refresh').maybeSingle();
@@ -465,18 +519,28 @@ const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 // ─────────────────────────────────────────────────────────────────────────────
 // Prompts
 // ─────────────────────────────────────────────────────────────────────────────
-function questPrompt(subjectId, gradeLevel, assignedConcept) {
+function questPrompt(subjectId, gradeLevel, assignedConcept, scenario, recentTitles) {
   const labels = { math: 'Math', english: 'English / Language Arts', science: 'Science', history: 'History' };
   const subject = labels[subjectId] || subjectId;
   const conceptLine = assignedConcept
     ? `THE CONCEPT FOR THIS QUEST IS: "${assignedConcept}". All 7 questions must test this exact concept. Do not choose a different topic.`
     : `Pick ONE focused concept appropriate for Grade ${gradeLevel} ${subject}. ALL 7 questions must test that single concept.`;
 
+  const scenarioLine = scenario
+    ? `\nSETTING: Frame the questTitle, storyIntro, and (where it fits naturally) the word problems around this setting: ${scenario}. Don't force it into every single question if it feels contrived — but the overall quest should feel distinctly set in this world, not generic.`
+    : '';
+
+  const avoidLine = (recentTitles && recentTitles.length)
+    ? `\nAVOID REPEATING: This concept has been used recently with these titles/scenarios — do NOT reuse their setting, numbers, or specific examples:\n${recentTitles.map(t => `- ${t}`).join('\n')}`
+    : '';
+
   return `Generate a ${subject} quest at Grade ${gradeLevel} curriculum level.
 
 IMPORTANT: Match content to Grade ${gradeLevel} curriculum standards exactly. The student is genuinely working at this level — make questions challenging but fair.
 
 ${conceptLine}
+${scenarioLine}
+${avoidLine}
 
 If any word problem features a student, refer to them as "the student" or use the placeholder {NAME}. Do not assume a name or gender. Use the placeholder {PRONOUN_SUBJECT} (they/he/she) and {PRONOUN_POSSESSIVE} (their/his/her) where pronouns are needed.
 
