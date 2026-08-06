@@ -1,9 +1,22 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// src/lib/claude.js  —  v11
+// src/lib/claude.js  —  v14
 //
 // v11 changes:
 //   - Tone profile injected into explanation + stretch prompts based on profile slot
 //   - Strand passed through on explanation calls (for future misconception tagging)
+//
+// v14 (confirmed defect): calcNextDifficulty had no ceiling and no per-day
+// limit. It runs once per finished quest, and pool quests serve in <1s, so a
+// kid replaying a subject they're doing well in could climb one full grade
+// PER QUEST with nothing to stop it. Confirmed in production: a 3rd-grader's
+// profile reached Grade 11-12 across all four subjects in a single session
+// after auto-adjust was unlocked. This also caused the quest-repeat reports —
+// pools are only generated for base grade +1, so pushing a profile past that
+// range leaves an empty/near-empty pool, which serves the same live-fallback
+// quest over and over.
+//
+// Fix: a ceiling of (base_grade_num + 2), and at most one adjustment per
+// subject per calendar day, regardless of how many quests are completed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const PROXY_URL = '/api/claude';
@@ -331,12 +344,28 @@ export function getDifficultyLabel(level) {
   return labels[level] || `Grade ${level}`;
 }
 
-export function calcNextDifficulty(currentLevel, recentScores, isLocked = false) {
-  if (isLocked) return currentLevel;
-  if (recentScores.length < 2) return currentLevel;
+// v14: signature change. Callers must now pass an options object and read
+// { level, adjusted } from the result instead of a bare number.
+//
+//   opts.isLocked         — parent lock, unchanged behavior
+//   opts.baseGradeNum     — the child's real grade; ceiling = baseGradeNum + 2
+//   opts.lastAdjustedDate — 'YYYY-MM-DD' of the last change to this subject,
+//                           or null. If it's today, no further change is made
+//                           regardless of scores — this is the daily cap.
+export function calcNextDifficulty(currentLevel, recentScores, opts = {}) {
+  const { isLocked = false, baseGradeNum = currentLevel, lastAdjustedDate = null } = opts;
+
+  if (isLocked) return { level: currentLevel, adjusted: false };
+  if (recentScores.length < 2) return { level: currentLevel, adjusted: false };
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+  if (lastAdjustedDate === todayStr) return { level: currentLevel, adjusted: false };
+
   const last2 = recentScores.slice(0, 2);
   const avg = last2.reduce((a, b) => a + b, 0) / 2;
-  if (avg >= 85 && currentLevel < 12) return currentLevel + 1;
-  if (avg < 60 && currentLevel > 1) return currentLevel - 1;
-  return currentLevel;
+  const ceiling = Math.min(12, baseGradeNum + 2);
+
+  if (avg >= 85 && currentLevel < ceiling) return { level: currentLevel + 1, adjusted: true };
+  if (avg < 60 && currentLevel > 1) return { level: currentLevel - 1, adjusted: true };
+  return { level: currentLevel, adjusted: false };
 }

@@ -356,10 +356,17 @@ export default function App() {
         .map(h => h.score)
       const currentDiff = prof.difficulty_levels?.[activeSubject.id] || prof.base_grade_num
       const isLocked = !!(prof.difficulty_locked || {})[activeSubject.id]
-      const nextDiff = calcNextDifficulty(currentDiff, subjectScores, isLocked)
-      if (nextDiff !== currentDiff) {
+      const lastAdjustedDate = (prof.difficulty_adjusted_at || {})[activeSubject.id] || null
+      const { level: nextDiff, adjusted } = calcNextDifficulty(currentDiff, subjectScores, {
+        isLocked,
+        baseGradeNum: prof.base_grade_num,
+        lastAdjustedDate,
+      })
+      if (adjusted && nextDiff !== currentDiff) {
+        const todayStr = new Date().toISOString().slice(0, 10)
         const newLevels = { ...(prof.difficulty_levels || {}), [activeSubject.id]: nextDiff }
-        prof = await updateProfile({ ...prof, difficulty_levels: newLevels })
+        const newAdjustedAt = { ...(prof.difficulty_adjusted_at || {}), [activeSubject.id]: todayStr }
+        prof = await updateProfile({ ...prof, difficulty_levels: newLevels, difficulty_adjusted_at: newAdjustedAt })
         if (nextDiff > currentDiff) {
           prof = await awardBadge(prof, 'leveled_up')
           showNotif(`Difficulty increased in ${activeSubject.label}!`, '⬆️', 4000)
