@@ -66,11 +66,21 @@ function randomScenario() {
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const TARGET_POOL_SIZE = 30;       // was 45. With ~16 scoped combos this is
+const TARGET_POOL_SIZE = 30;       // was 45. With ~21 scoped combos this is
                                     // still ~4 weeks of quests per combo at
                                     // 1/day, and cuts backfill cost sharply.
-const ROTATION_PER_COMBO = 10;
-const COMBOS_PER_RUN = 4;           // 4 of ~16 => full turnover every ~4 days
+
+// v15: confirmed via Anthropic usage CSV that daily rotation churn (retiring
+// and regenerating a fixed slice every single run, whether the pool needed
+// it or not) cost ~$0.49/day steady-state — ~$15/mo against a requested
+// $5/mo budget. Cut both the per-run slice and the run frequency (see
+// .github/workflows/refill-pool.yml, now every 2 days instead of daily).
+// Together this targets ~$3/mo in generation, full pool turnover in ~3 weeks
+// (close to the original ~2-week design target from before the runaway
+// difficulty-adjust incident inflated the scoped combo count).
+const ROTATION_PER_COMBO = 8;       // was 10
+const COMBOS_PER_RUN = 2;           // was 4. 2 of ~21 combos, run every 2
+                                    // days => full turnover in ~3 weeks.
 const CONCURRENCY = 5;
 const MAX_RETRIES = 3;
 

@@ -1,12 +1,21 @@
 name: Refill Quest Pool
 
 # Runs the pool generator on GitHub's servers (6-hour limit — no Vercel 60s ceiling).
-# Fills starved pools and rotates stale quests once per day.
+# Fills starved pools and rotates stale quests every 2 days.
+#
+# v15: was daily. Confirmed via Anthropic usage CSV that daily rotation churn
+# (retiring/regenerating a fixed slice every run regardless of need) cost
+# ~$0.49/day steady-state (~$15/mo) — over 4.5x the requested $5/mo budget.
+# Combined with reducing COMBOS_PER_RUN and ROTATION_PER_COMBO below, this
+# targets ~$3/mo in generation, full pool turnover in ~3 weeks.
 
 on:
-  # Daily at 07:00 UTC (same cadence the old Vercel cron used).
+  # Every 2 days at 07:00 UTC. Day-of-month step syntax is the standard
+  # workaround for GitHub Actions' cron (no native "every N days" field) —
+  # runs on odd days of the month (1, 3, 5, ...), close enough to a true
+  # 48h cadence for this purpose.
   schedule:
-    - cron: '0 7 * * *'
+    - cron: '0 7 */2 * *'
   # Manual "Run workflow" button in the Actions tab — use this to fill on demand.
   workflow_dispatch:
 
